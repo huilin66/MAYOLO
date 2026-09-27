@@ -1,0 +1,1293 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Transformer modules."""
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.init import constant_, xavier_uniform_
+
+from .conv import Conv
+from .utils import _get_clones, inverse_sigmoid, multi_scale_deformable_attn_pytorch
+
+__all__ = (
+    "TransformerEncoderLayer",
+    "TransformerLayer",
+    "TransformerBlock",
+    "MLPBlock",
+    "LayerNorm2d",
+    "AIFI",
+    "DeformableTransformerDecoder",
+    "DeformableTransformerDecoderLayer",
+    "MSDeformAttn",
+    "MLP",
+    "TransformerEncoder",
+
+)
+
+def _get_clones(module, N):
+    from copy import deepcopy
+    return nn.ModuleList([deepcopy(module) for _ in range(N)])
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super(TransformerEncoder, self).__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src, src_mask=None, pos_embed=None):
+        output = src
+        for layer in self.layers:
+            output = layer(output, src_mask=src_mask, pos_embed=pos_embed)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Defines a single layer of the transformer encoder.
+
+    Attributes:
+        ma (nn.MultiheadAttention): Multi-head attention module.
+        fc1 (nn.Linear): First linear layer in the feedforward network.
+        fc2 (nn.Linear): Second linear layer in the feedforward network.
+        norm1 (nn.LayerNorm): Layer normalization after attention.
+        norm2 (nn.LayerNorm): Layer normalization after feedforward network.
+        dropout (nn.Dropout): Dropout layer for the feedforward network.
+        dropout1 (nn.Dropout): Dropout layer after attention.
+        dropout2 (nn.Dropout): Dropout layer after feedforward network.
+        act (nn.Module): Activation function.
+        normalize_before (bool): Whether to apply normalization before attention and feedforward.
+    """
+
+    def __init__(self, c1, cm=2048, num_heads=8, dropout=0.0, act=nn.GELU(), normalize_before=False):
+        """
+        Initialize the TransformerEncoderLayer with specified parameters.
+
+        Args:
+            c1 (int): Input dimension.
+            cm (int): Hidden dimension in the feedforward network.
+            num_heads (int): Number of attention heads.
+            dropout (float): Dropout probability.
+            act (nn.Module): Activation function.
+            normalize_before (bool): Whether to apply normalization before attention and feedforward.
+        """
+        super().__init__()
+        from ...utils.torch_utils import TORCH_1_9
+
+        if not TORCH_1_9:
+            raise ModuleNotFoundError(
+                "TransformerEncoderLayer() requires torch>=1.9 to use nn.MultiheadAttention(batch_first=True)."
+            )
+        self.ma = nn.MultiheadAttention(c1, num_heads, dropout=dropout, batch_first=True)
+        # Implementation of Feedforward model
+        self.fc1 = nn.Linear(c1, cm)
+        self.fc2 = nn.Linear(cm, c1)
+
+        self.norm1 = nn.LayerNorm(c1)
+        self.norm2 = nn.LayerNorm(c1)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.act = act
+        self.normalize_before = normalize_before
+
+    @staticmethod
+    def with_pos_embed(tensor, pos=None):
+        """Add position embeddings to the tensor if provided."""
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
+        """
+        Perform forward pass with post-normalization.
+
+        Args:
+            src (torch.Tensor): Input tensor.
+            src_mask (torch.Tensor, optional): Mask for the src sequence.
+            src_key_padding_mask (torch.Tensor, optional): Mask for the src keys per batch.
+            pos (torch.Tensor, optional): Positional encoding.
+
+        Returns:
+            (torch.Tensor): Output tensor after attention and feedforward.
+        """
+        q = k = self.with_pos_embed(src, pos)
+        src2 = self.ma(q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.fc2(self.dropout(self.act(self.fc1(src))))
+        src = src + self.dropout2(src2)
+        return self.norm2(src)
+
+    def forward_pre(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
+        """
+        Perform forward pass with pre-normalization.
+
+        Args:
+            src (torch.Tensor): Input tensor.
+            src_mask (torch.Tensor, optional): Mask for the src sequence.
+            src_key_padding_mask (torch.Tensor, optional): Mask for the src keys per batch.
+            pos (torch.Tensor, optional): Positional encoding.
+
+        Returns:
+            (torch.Tensor): Output tensor after attention and feedforward.
+        """
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.ma(q, k, value=src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src2 = self.norm2(src)
+        src2 = self.fc2(self.dropout(self.act(self.fc1(src2))))
+        return src + self.dropout2(src2)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, pos=None):
+        """
+        Forward propagates the input through the encoder module.
+
+        Args:
+            src (torch.Tensor): Input tensor.
+            src_mask (torch.Tensor, optional): Mask for the src sequence.
+            src_key_padding_mask (torch.Tensor, optional): Mask for the src keys per batch.
+            pos (torch.Tensor, optional): Positional encoding.
+
+        Returns:
+            (torch.Tensor): Output tensor after transformer encoder layer.
+        """
+        if self.normalize_before:
+            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
+
+
+class AIFI(TransformerEncoderLayer):
+    """
+    Defines the AIFI transformer layer.
+
+    This class extends TransformerEncoderLayer to work with 2D data by adding positional embeddings.
+    """
+
+    def __init__(self, c1, cm=2048, num_heads=8, dropout=0, act=nn.GELU(), normalize_before=False):
+        """
+        Initialize the AIFI instance with specified parameters.
+
+        Args:
+            c1 (int): Input dimension.
+            cm (int): Hidden dimension in the feedforward network.
+            num_heads (int): Number of attention heads.
+            dropout (float): Dropout probability.
+            act (nn.Module): Activation function.
+            normalize_before (bool): Whether to apply normalization before attention and feedforward.
+        """
+        super().__init__(c1, cm, num_heads, dropout, act, normalize_before)
+
+    def forward(self, x):
+        """
+        Forward pass for the AIFI transformer layer.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape [B, C, H, W].
+
+        Returns:
+            (torch.Tensor): Output tensor with shape [B, C, H, W].
+        """
+        c, h, w = x.shape[1:]
+        pos_embed = self.build_2d_sincos_position_embedding(w, h, c)
+        # Flatten [B, C, H, W] to [B, HxW, C]
+        x = super().forward(x.flatten(2).permute(0, 2, 1), pos=pos_embed.to(device=x.device, dtype=x.dtype))
+        return x.permute(0, 2, 1).view([-1, c, h, w]).contiguous()
+
+    @staticmethod
+    def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):
+        """
+        Build 2D sine-cosine position embedding.
+
+        Args:
+            w (int): Width of the feature map.
+            h (int): Height of the feature map.
+            embed_dim (int): Embedding dimension.
+            temperature (float): Temperature for the sine/cosine functions.
+
+        Returns:
+            (torch.Tensor): Position embedding with shape [1, embed_dim, h*w].
+        """
+        assert embed_dim % 4 == 0, "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
+        grid_w = torch.arange(w, dtype=torch.float32)
+        grid_h = torch.arange(h, dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
+        pos_dim = embed_dim // 4
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1.0 / (temperature**omega)
+
+        out_w = grid_w.flatten()[..., None] @ omega[None]
+        out_h = grid_h.flatten()[..., None] @ omega[None]
+
+        return torch.cat([torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], 1)[None]
+
+
+class TransformerLayer(nn.Module):
+    """Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)."""
+
+    def __init__(self, c, num_heads):
+        """
+        Initialize a self-attention mechanism using linear transformations and multi-head attention.
+
+        Args:
+            c (int): Input and output channel dimension.
+            num_heads (int): Number of attention heads.
+        """
+        super().__init__()
+        self.q = nn.Linear(c, c, bias=False)
+        self.k = nn.Linear(c, c, bias=False)
+        self.v = nn.Linear(c, c, bias=False)
+        self.ma = nn.MultiheadAttention(embed_dim=c, num_heads=num_heads)
+        self.fc1 = nn.Linear(c, c, bias=False)
+        self.fc2 = nn.Linear(c, c, bias=False)
+
+    def forward(self, x):
+        """
+        Apply a transformer block to the input x and return the output.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after transformer layer.
+        """
+        x = self.ma(self.q(x), self.k(x), self.v(x))[0] + x
+        return self.fc2(self.fc1(x)) + x
+
+
+class TransformerBlock(nn.Module):
+    """
+    Vision Transformer https://arxiv.org/abs/2010.11929.
+
+    Attributes:
+        conv (Conv, optional): Convolution layer if input and output channels differ.
+        linear (nn.Linear): Learnable position embedding.
+        tr (nn.Sequential): Sequential container of transformer layers.
+        c2 (int): Output channel dimension.
+    """
+
+    def __init__(self, c1, c2, num_heads, num_layers):
+        """
+        Initialize a Transformer module with position embedding and specified number of heads and layers.
+
+        Args:
+            c1 (int): Input channel dimension.
+            c2 (int): Output channel dimension.
+            num_heads (int): Number of attention heads.
+            num_layers (int): Number of transformer layers.
+        """
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+        self.linear = nn.Linear(c2, c2)  # learnable position embedding
+        self.tr = nn.Sequential(*(TransformerLayer(c2, num_heads) for _ in range(num_layers)))
+        self.c2 = c2
+
+    def forward(self, x):
+        """
+        Forward propagates the input through the bottleneck module.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape [b, c1, w, h].
+
+        Returns:
+            (torch.Tensor): Output tensor with shape [b, c2, w, h].
+        """
+        if self.conv is not None:
+            x = self.conv(x)
+        b, _, w, h = x.shape
+        p = x.flatten(2).permute(2, 0, 1)
+        return self.tr(p + self.linear(p)).permute(1, 2, 0).reshape(b, self.c2, w, h)
+
+
+class MLPBlock(nn.Module):
+    """Implements a single block of a multi-layer perceptron."""
+
+    def __init__(self, embedding_dim, mlp_dim, act=nn.GELU):
+        """
+        Initialize the MLPBlock with specified embedding dimension, MLP dimension, and activation function.
+
+        Args:
+            embedding_dim (int): Input and output dimension.
+            mlp_dim (int): Hidden dimension.
+            act (nn.Module): Activation function.
+        """
+        super().__init__()
+        self.lin1 = nn.Linear(embedding_dim, mlp_dim)
+        self.lin2 = nn.Linear(mlp_dim, embedding_dim)
+        self.act = act()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MLPBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after MLP block.
+        """
+        return self.lin2(self.act(self.lin1(x)))
+
+
+class MLP(nn.Module):
+    """
+    Implements a simple multi-layer perceptron (also called FFN).
+
+    Attributes:
+        num_layers (int): Number of layers in the MLP.
+        layers (nn.ModuleList): List of linear layers.
+        sigmoid (bool): Whether to apply sigmoid to the output.
+        act (nn.Module): Activation function.
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, act=nn.ReLU, sigmoid=False):
+        """
+        Initialize the MLP with specified input, hidden, output dimensions and number of layers.
+
+        Args:
+            input_dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension.
+            output_dim (int): Output dimension.
+            num_layers (int): Number of layers.
+            act (nn.Module): Activation function.
+            sigmoid (bool): Whether to apply sigmoid to the output.
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.sigmoid = sigmoid
+        self.act = act()
+
+    def forward(self, x):
+        """
+        Forward pass for the entire MLP.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after MLP.
+        """
+        for i, layer in enumerate(self.layers):
+            x = getattr(self, "act", nn.ReLU())(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x.sigmoid() if getattr(self, "sigmoid", False) else x
+
+
+class LayerNorm2d(nn.Module):
+    """
+    2D Layer Normalization module inspired by Detectron2 and ConvNeXt implementations.
+
+    Original implementations in
+    https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py
+    and
+    https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py.
+
+    Attributes:
+        weight (nn.Parameter): Learnable scale parameter.
+        bias (nn.Parameter): Learnable bias parameter.
+        eps (float): Small constant for numerical stability.
+    """
+
+    def __init__(self, num_channels, eps=1e-6):
+        """
+        Initialize LayerNorm2d with the given parameters.
+
+        Args:
+            num_channels (int): Number of channels in the input.
+            eps (float): Small constant for numerical stability.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x):
+        """
+        Perform forward pass for 2D layer normalization.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Normalized output tensor.
+        """
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+
+
+class MSDeformAttn(nn.Module):
+    """
+    Multiscale Deformable Attention Module based on Deformable-DETR and PaddleDetection implementations.
+
+    https://github.com/fundamentalvision/Deformable-DETR/blob/main/models/ops/modules/ms_deform_attn.py
+
+    Attributes:
+        im2col_step (int): Step size for im2col operations.
+        d_model (int): Model dimension.
+        n_levels (int): Number of feature levels.
+        n_heads (int): Number of attention heads.
+        n_points (int): Number of sampling points per attention head per feature level.
+        sampling_offsets (nn.Linear): Linear layer for generating sampling offsets.
+        attention_weights (nn.Linear): Linear layer for generating attention weights.
+        value_proj (nn.Linear): Linear layer for projecting values.
+        output_proj (nn.Linear): Linear layer for projecting output.
+    """
+
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
+        """
+        Initialize MSDeformAttn with the given parameters.
+
+        Args:
+            d_model (int): Model dimension.
+            n_levels (int): Number of feature levels.
+            n_heads (int): Number of attention heads.
+            n_points (int): Number of sampling points per attention head per feature level.
+        """
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model must be divisible by n_heads, but got {d_model} and {n_heads}")
+        _d_per_head = d_model // n_heads
+        # Better to set _d_per_head to a power of 2 which is more efficient in a CUDA implementation
+        assert _d_per_head * n_heads == d_model, "`d_model` must be divisible by `n_heads`"
+
+        self.im2col_step = 64
+
+        self.d_model = d_model
+        self.n_levels = n_levels
+        self.n_heads = n_heads
+        self.n_points = n_points
+
+        self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.output_proj = nn.Linear(d_model, d_model)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Reset module parameters."""
+        constant_(self.sampling_offsets.weight.data, 0.0)
+        thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        grid_init = (
+            (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
+            .view(self.n_heads, 1, 1, 2)
+            .repeat(1, self.n_levels, self.n_points, 1)
+        )
+        for i in range(self.n_points):
+            grid_init[:, :, i, :] *= i + 1
+        with torch.no_grad():
+            self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
+        constant_(self.attention_weights.weight.data, 0.0)
+        constant_(self.attention_weights.bias.data, 0.0)
+        xavier_uniform_(self.value_proj.weight.data)
+        constant_(self.value_proj.bias.data, 0.0)
+        xavier_uniform_(self.output_proj.weight.data)
+        constant_(self.output_proj.bias.data, 0.0)
+
+    def forward(self, query, refer_bbox, value, value_shapes, value_mask=None):
+        """
+        Perform forward pass for multiscale deformable attention.
+
+        https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
+
+        Args:
+            query (torch.Tensor): Tensor with shape [bs, query_length, C].
+            refer_bbox (torch.Tensor): Tensor with shape [bs, query_length, n_levels, 2], range in [0, 1],
+                top-left (0,0), bottom-right (1, 1), including padding area.
+            value (torch.Tensor): Tensor with shape [bs, value_length, C].
+            value_shapes (List): List with shape [n_levels, 2], [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})].
+            value_mask (torch.Tensor, optional): Tensor with shape [bs, value_length], True for non-padding elements,
+                False for padding elements.
+
+        Returns:
+            (torch.Tensor): Output tensor with shape [bs, Length_{query}, C].
+        """
+        bs, len_q = query.shape[:2]
+        len_v = value.shape[1]
+        assert sum(s[0] * s[1] for s in value_shapes) == len_v
+
+        value = self.value_proj(value)
+        if value_mask is not None:
+            value = value.masked_fill(value_mask[..., None], float(0))
+        value = value.view(bs, len_v, self.n_heads, self.d_model // self.n_heads)
+        sampling_offsets = self.sampling_offsets(query).view(bs, len_q, self.n_heads, self.n_levels, self.n_points, 2)
+        attention_weights = self.attention_weights(query).view(bs, len_q, self.n_heads, self.n_levels * self.n_points)
+        attention_weights = F.softmax(attention_weights, -1).view(bs, len_q, self.n_heads, self.n_levels, self.n_points)
+        # N, Len_q, n_heads, n_levels, n_points, 2
+        num_points = refer_bbox.shape[-1]
+        if num_points == 2:
+            offset_normalizer = torch.as_tensor(value_shapes, dtype=query.dtype, device=query.device).flip(-1)
+            add = sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            sampling_locations = refer_bbox[:, :, None, :, None, :] + add
+        elif num_points == 4:
+            add = sampling_offsets / self.n_points * refer_bbox[:, :, None, :, None, 2:] * 0.5
+            sampling_locations = refer_bbox[:, :, None, :, None, :2] + add
+        else:
+            raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {num_points}.")
+        output = multi_scale_deformable_attn_pytorch(value, value_shapes, sampling_locations, attention_weights)
+        return self.output_proj(output)
+
+
+class DeformableTransformerDecoderLayer(nn.Module):
+    """
+    Deformable Transformer Decoder Layer inspired by PaddleDetection and Deformable-DETR implementations.
+
+    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
+    https://github.com/fundamentalvision/Deformable-DETR/blob/main/models/deformable_transformer.py
+
+    Attributes:
+        self_attn (nn.MultiheadAttention): Self-attention module.
+        dropout1 (nn.Dropout): Dropout after self-attention.
+        norm1 (nn.LayerNorm): Layer normalization after self-attention.
+        cross_attn (MSDeformAttn): Cross-attention module.
+        dropout2 (nn.Dropout): Dropout after cross-attention.
+        norm2 (nn.LayerNorm): Layer normalization after cross-attention.
+        linear1 (nn.Linear): First linear layer in the feedforward network.
+        act (nn.Module): Activation function.
+        dropout3 (nn.Dropout): Dropout in the feedforward network.
+        linear2 (nn.Linear): Second linear layer in the feedforward network.
+        dropout4 (nn.Dropout): Dropout after the feedforward network.
+        norm3 (nn.LayerNorm): Layer normalization after the feedforward network.
+    """
+
+    def __init__(self, d_model=256, n_heads=8, d_ffn=1024, dropout=0.0, act=nn.ReLU(), n_levels=4, n_points=4):
+        """
+        Initialize the DeformableTransformerDecoderLayer with the given parameters.
+
+        Args:
+            d_model (int): Model dimension.
+            n_heads (int): Number of attention heads.
+            d_ffn (int): Dimension of the feedforward network.
+            dropout (float): Dropout probability.
+            act (nn.Module): Activation function.
+            n_levels (int): Number of feature levels.
+            n_points (int): Number of sampling points.
+        """
+        super().__init__()
+
+        # Self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # Cross attention
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.act = act
+        self.dropout3 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(d_model)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        """Add positional embeddings to the input tensor, if provided."""
+        return tensor if pos is None else tensor + pos
+
+    def forward_ffn(self, tgt):
+        """
+        Perform forward pass through the Feed-Forward Network part of the layer.
+
+        Args:
+            tgt (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after FFN.
+        """
+        tgt2 = self.linear2(self.dropout3(self.act(self.linear1(tgt))))
+        tgt = tgt + self.dropout4(tgt2)
+        return self.norm3(tgt)
+
+    def forward(self, embed, refer_bbox, feats, shapes, padding_mask=None, attn_mask=None, query_pos=None):
+        """
+        Perform the forward pass through the entire decoder layer.
+
+        Args:
+            embed (torch.Tensor): Input embeddings.
+            refer_bbox (torch.Tensor): Reference bounding boxes.
+            feats (torch.Tensor): Feature maps.
+            shapes (List): Feature shapes.
+            padding_mask (torch.Tensor, optional): Padding mask.
+            attn_mask (torch.Tensor, optional): Attention mask.
+            query_pos (torch.Tensor, optional): Query position embeddings.
+
+        Returns:
+            (torch.Tensor): Output tensor after decoder layer.
+        """
+        # Self attention
+        q = k = self.with_pos_embed(embed, query_pos)
+        tgt = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), embed.transpose(0, 1), attn_mask=attn_mask)[
+            0
+        ].transpose(0, 1)
+        embed = embed + self.dropout1(tgt)
+        embed = self.norm1(embed)
+
+        # Cross attention
+        tgt = self.cross_attn(
+            self.with_pos_embed(embed, query_pos), refer_bbox.unsqueeze(2), feats, shapes, padding_mask
+        )
+        embed = embed + self.dropout2(tgt)
+        embed = self.norm2(embed)
+
+        # FFN
+        return self.forward_ffn(embed)
+
+
+class DeformableTransformerDecoder(nn.Module):
+    """
+    Implementation of Deformable Transformer Decoder based on PaddleDetection.
+
+    https://github.com/PaddlePaddle/PaddleDetection/blob/develop/ppdet/modeling/transformers/deformable_transformer.py
+
+    Attributes:
+        layers (nn.ModuleList): List of decoder layers.
+        num_layers (int): Number of decoder layers.
+        hidden_dim (int): Hidden dimension.
+        eval_idx (int): Index of the layer to use during evaluation.
+    """
+
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+        """
+        Initialize the DeformableTransformerDecoder with the given parameters.
+
+        Args:
+            hidden_dim (int): Hidden dimension.
+            decoder_layer (nn.Module): Decoder layer module.
+            num_layers (int): Number of decoder layers.
+            eval_idx (int): Index of the layer to use during evaluation.
+        """
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+
+    def forward(
+        self,
+        embed,  # decoder embeddings
+        refer_bbox,  # anchor
+        feats,  # image features
+        shapes,  # feature shapes
+        bbox_head,
+        score_head,
+        pos_mlp,
+        attn_mask=None,
+        padding_mask=None,
+        attribute_head=None,
+    ):
+        """
+        Perform the forward pass through the entire decoder.
+
+        Args:
+            embed (torch.Tensor): Decoder embeddings.
+            refer_bbox (torch.Tensor): Reference bounding boxes.
+            feats (torch.Tensor): Image features.
+            shapes (List): Feature shapes.
+            bbox_head (nn.Module): Bounding box prediction head.
+            score_head (nn.Module): Score prediction head.
+            pos_mlp (nn.Module): Position MLP.
+            attn_mask (torch.Tensor, optional): Attention mask.
+            padding_mask (torch.Tensor, optional): Padding mask.
+            attribute_head (nn.ModuleList, optional): Per-layer attribute prediction heads.
+
+        Returns:
+            dec_bboxes (torch.Tensor): Decoded bounding boxes.
+            dec_cls (torch.Tensor): Decoded classification scores.
+            dec_attributes (torch.Tensor, optional): Attribute logits when ``attribute_head`` is provided.
+        """
+        output = embed
+        dec_bboxes = []
+        dec_cls = []
+        dec_attributes = []
+        last_refined_bbox = None
+        refer_bbox = refer_bbox.sigmoid()
+        for i, layer in enumerate(self.layers):
+            output = layer(output, refer_bbox, feats, shapes, padding_mask, attn_mask, pos_mlp(refer_bbox))
+
+            bbox = bbox_head[i](output)
+            refined_bbox = torch.sigmoid(bbox + inverse_sigmoid(refer_bbox))
+
+            if self.training:
+                dec_cls.append(score_head[i](output))
+                if attribute_head is not None:
+                    dec_attributes.append(attribute_head[i](output))
+                if i == 0:
+                    dec_bboxes.append(refined_bbox)
+                else:
+                    dec_bboxes.append(torch.sigmoid(bbox + inverse_sigmoid(last_refined_bbox)))
+            elif i == self.eval_idx:
+                dec_cls.append(score_head[i](output))
+                if attribute_head is not None:
+                    dec_attributes.append(attribute_head[i](output))
+                dec_bboxes.append(refined_bbox)
+                break
+
+            last_refined_bbox = refined_bbox
+            refer_bbox = refined_bbox.detach() if self.training else refined_bbox
+
+        outputs = (torch.stack(dec_bboxes), torch.stack(dec_cls))
+        return (*outputs, torch.stack(dec_attributes)) if attribute_head is not None else outputs
+
+
+class SwinTransformerBlock(nn.Module):
+    def __init__(self, c1, c2, num_heads, num_layers, window_size=8):
+        super().__init__()
+        self.conv = None
+        if c1 != c2:
+            self.conv = Conv(c1, c2)
+
+        # remove input_resolution
+        self.blocks = nn.Sequential(*[SwinTransformerLayer(dim=c2, num_heads=num_heads, window_size=window_size,
+                                                           shift_size=0 if (i % 2 == 0) else window_size // 2) for i in
+                                      range(num_layers)])
+
+    def forward(self, x):
+        if self.conv is not None:
+            x = self.conv(x)
+        x = self.blocks(x)
+        return x
+
+
+class WindowAttention(nn.Module):
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        nn.init.normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        # print(attn.dtype, v.dtype)
+        try:
+            x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        except:
+            # print(attn.dtype, v.dtype)
+            x = (attn.half() @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class Mlp(nn.Module):
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class SwinTransformerLayer(nn.Module):
+
+    def __init__(self, dim, num_heads, window_size=8, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.SiLU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        from timm.models.layers import DropPath
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        # if min(self.input_resolution) <= self.window_size:
+        #     # if window size is larger than input resolution, we don't partition windows
+        #     self.shift_size = 0
+        #     self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def create_mask(self, H, W):
+        # calculate attention mask for SW-MSA
+        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+        h_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        def window_partition(x, window_size):
+            """
+            Args:
+                x: (B, H, W, C)
+                window_size (int): window size
+            Returns:
+                windows: (num_windows*B, window_size, window_size, C)
+            """
+            B, H, W, C = x.shape
+            x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+            windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+            return windows
+
+        def window_reverse(windows, window_size, H, W):
+            """
+            Args:
+                windows: (num_windows*B, window_size, window_size, C)
+                window_size (int): Window size
+                H (int): Height of image
+                W (int): Width of image
+            Returns:
+                x: (B, H, W, C)
+            """
+            B = int(windows.shape[0] / (H * W / window_size / window_size))
+            x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+            return x
+
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+
+        return attn_mask
+
+    def forward(self, x):
+        # reshape x[b c h w] to x[b l c]
+        _, _, H_, W_ = x.shape
+
+        Padding = False
+        if min(H_, W_) < self.window_size or H_ % self.window_size != 0 or W_ % self.window_size != 0:
+            Padding = True
+            # print(f'img_size {min(H_, W_)} is less than (or not divided by) window_size {self.window_size}, Padding.')
+            pad_r = (self.window_size - W_ % self.window_size) % self.window_size
+            pad_b = (self.window_size - H_ % self.window_size) % self.window_size
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+
+        # print('2', x.shape)
+        B, C, H, W = x.shape
+        L = H * W
+        x = x.permute(0, 2, 3, 1).contiguous().view(B, L, C)  # b, L, c
+
+        # create mask from init to forward
+        if self.shift_size > 0:
+            attn_mask = self.create_mask(H, W).to(x.device)
+        else:
+            attn_mask = None
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        def window_partition(x, window_size):
+            """
+            Args:
+                x: (B, H, W, C)
+                window_size (int): window size
+            Returns:
+                windows: (num_windows*B, window_size, window_size, C)
+            """
+            B, H, W, C = x.shape
+            x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+            windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+            return windows
+
+        def window_reverse(windows, window_size, H, W):
+            """
+            Args:
+                windows: (num_windows*B, window_size, window_size, C)
+                window_size (int): Window size
+                H (int): Height of image
+                W (int): Width of image
+            Returns:
+                x: (B, H, W, C)
+            """
+            B = int(windows.shape[0] / (H * W / window_size / window_size))
+            x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+            return x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x.view(B, H * W, C)
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        x = x.permute(0, 2, 1).contiguous().view(-1, C, H, W)  # b c h w
+
+        if Padding:
+            x = x[:, :, :H_, :W_]  # reverse padding
+
+        return x
+
+
+
+# region code for tfd
+import math
+from copy import deepcopy
+
+def linear_init_(module):
+    bound = 1 / math.sqrt(module.weight.shape[0])
+    torch.nn.init.uniform_(module.weight, -bound, bound)
+    if hasattr(module, "bias") and module.bias is not None:
+        torch.nn.init.uniform_(module.bias, -bound, bound)
+
+class MultiHeadAttention(nn.Module):
+    """
+    Attention mapps queries and a set of key-value pairs to outputs, and
+    Multi-Head Attention performs multiple parallel attention to jointly attending
+    to information from different representation subspaces.
+
+    Please refer to `Attention Is All You Need <https://arxiv.org/pdf/1706.03762.pdf>`_
+    for more details.
+
+    Parameters:
+        embed_dim (int): The expected feature size in the input and output.
+        num_heads (int): The number of heads in multi-head attention.
+        dropout (float, optional): The dropout probability used on attention
+            weights to drop some attention targets. 0 for no dropout. Default 0
+        kdim (int, optional): The feature size in key. If None, assumed equal to
+            `embed_dim`. Default None.
+        vdim (int, optional): The feature size in value. If None, assumed equal to
+            `embed_dim`. Default None.
+        need_weights (bool, optional): Indicate whether to return the attention
+            weights. Default False.
+
+    Examples:
+
+        .. code-block:: python
+
+            import paddle
+
+            # encoder input: [batch_size, sequence_length, d_model]
+            query = paddle.rand((2, 4, 128))
+            # self attention mask: [batch_size, num_heads, query_len, query_len]
+            attn_mask = paddle.rand((2, 2, 4, 4))
+            multi_head_attn = paddle.nn.MultiHeadAttention(128, 2)
+            output = multi_head_attn(query, None, None, attn_mask=attn_mask)  # [2, 4, 128]
+    """
+
+
+
+    def __init__(self,
+                 embed_dim,
+                 num_heads,
+                 dropout=0.,
+                 kdim=None,
+                 vdim=None,
+                 need_weights=False):
+        super(MultiHeadAttention, self).__init__()
+        from torch.nn.parameter import Parameter
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.need_weights = need_weights
+
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+
+        if not self._qkv_same_embed_dim:
+            self.q_proj_weight = Parameter(torch.empty((embed_dim, embed_dim), ))
+            self.k_proj_weight = Parameter(torch.empty((embed_dim, self.kdim), ))
+            self.v_proj_weight = Parameter(torch.empty((embed_dim, self.vdim), ))
+            self.register_parameter('in_proj_weight', None)
+        else:
+            self.in_proj_weight = Parameter(torch.empty((embed_dim, 3 * embed_dim), ))
+            self.in_proj_bias = Parameter(torch.empty((3 * embed_dim), ))
+            self.register_parameter('q_proj_weight', None)
+            self.register_parameter('k_proj_weight', None)
+            self.register_parameter('v_proj_weight', None)
+
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self._type_list = ('q_proj', 'k_proj', 'v_proj')
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        from torch.nn.init import constant_, xavier_uniform_
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                xavier_uniform_(p)
+            else:
+                constant_(p, 0)
+
+    def compute_qkv(self, tensor, index):
+        if self._qkv_same_embed_dim:
+            tensor = F.linear(
+                x=tensor,
+                weight=self.in_proj_weight[:, index * self.embed_dim:(index + 1)
+                                           * self.embed_dim],
+                bias=self.in_proj_bias[index * self.embed_dim:(index + 1) *
+                                       self.embed_dim]
+                if self.in_proj_bias is not None else None)
+        else:
+            tensor = getattr(self, self._type_list[index])(tensor)
+        tensor = tensor.reshape(
+            [tensor.shape[0], tensor.shape[1], self.num_heads, self.head_dim]).transpose(1, 2)
+        return tensor
+
+    def forward(self, query, key=None, value=None, attn_mask=None):
+        r"""
+        Applies multi-head attention to map queries and a set of key-value pairs
+        to outputs.
+
+        Parameters:
+            query (Tensor): The queries for multi-head attention. It is a
+                tensor with shape `[batch_size, query_length, embed_dim]`. The
+                data type should be float32 or float64.
+            key (Tensor, optional): The keys for multi-head attention. It is
+                a tensor with shape `[batch_size, key_length, kdim]`. The
+                data type should be float32 or float64. If None, use `query` as
+                `key`. Default None.
+            value (Tensor, optional): The values for multi-head attention. It
+                is a tensor with shape `[batch_size, value_length, vdim]`.
+                The data type should be float32 or float64. If None, use `query` as
+                `value`. Default None.
+            attn_mask (Tensor, optional): A tensor used in multi-head attention
+                to prevents attention to some unwanted positions, usually the
+                paddings or the subsequent positions. It is a tensor with shape
+                broadcasted to `[batch_size, n_head, sequence_length, sequence_length]`.
+                When the data type is bool, the unwanted positions have `False`
+                values and the others have `True` values. When the data type is
+                int, the unwanted positions have 0 values and the others have 1
+                values. When the data type is float, the unwanted positions have
+                `-INF` values and the others have 0 values. It can be None when
+                nothing wanted or needed to be prevented attention to. Default None.
+
+        Returns:
+            Tensor|tuple: It is a tensor that has the same shape and data type \
+                as `query`, representing attention output. Or a tuple if \
+                `need_weights` is True or `cache` is not None. If `need_weights` \
+                is True, except for attention output, the tuple also includes \
+                the attention weights tensor shaped `[batch_size, num_heads, query_length, key_length]`. \
+                If `cache` is not None, the tuple then includes the new cache \
+                having the same type as `cache`, and if it is `StaticCache`, it \
+                is same as the input `cache`, if it is `Cache`, the new cache \
+                reserves tensors concatanating raw tensors with intermediate \
+                results of current query.
+        """
+
+        key = query if key is None else key
+        value = query if value is None else value
+        # compute q ,k ,v
+        q = query.reshape([query.shape[0], query.shape[1], 4, -1]).transpose(1, 2)
+        k = key.reshape([query.shape[0], query.shape[1], 4, -1]).transpose(1, 2)
+        v = value.reshape([query.shape[0], query.shape[1], 4, -1]).transpose(1, 2)
+
+        # scale dot product attention
+        product = torch.matmul(q, k.transpose(2, 3))
+        scaling = float(self.head_dim)**-0.5
+        product = product * scaling
+
+        if attn_mask is not None:
+            # Support bool or int mask
+            attn_mask = attn_mask.type_as(product.dtype)
+            product = product + attn_mask
+        weights = F.softmax(product)
+        if self.dropout:
+            weights = F.dropout(
+                weights,
+                self.dropout,
+                training=self.training)
+        # out = torch.matmul(weights, v)
+        out = torch.matmul(weights if self.training else weights.half(), v)
+
+        # combine heads
+        out = torch.transpose(out, 1, 2)
+        out = torch.reshape(out, [out.shape[0], out.shape[1], out.shape[2] * out.shape[3]])
+
+        # project to output
+        out = self.out_proj(out)
+
+        outs = [out]
+        if self.need_weights:
+            outs.append(weights)
+        return out if len(outs) == 1 else tuple(outs)
+
+
+# class TransformerEncoderLayer(nn.Module):
+#     def __init__(self,
+#                  d_model,
+#                  nhead,
+#                  dim_feedforward=2048,
+#                  dropout=0.1,
+#                  activation="relu",
+#                  attn_dropout=None,
+#                  act_dropout=None,
+#                  normalize_before=False):
+#         super(TransformerEncoderLayer, self).__init__()
+#         attn_dropout = dropout if attn_dropout is None else attn_dropout
+#         act_dropout = dropout if act_dropout is None else act_dropout
+#         self.normalize_before = normalize_before
+#
+#         self.self_attn = MultiHeadAttention(d_model, nhead, attn_dropout)
+#         # Implementation of Feedforward model
+#         self.linear1 = nn.Linear(d_model, dim_feedforward)
+#         self.dropout = nn.Dropout(act_dropout)
+#         self.linear2 = nn.Linear(dim_feedforward, d_model)
+#
+#         self.norm1 = nn.LayerNorm(d_model)
+#         self.norm2 = nn.LayerNorm(d_model)
+#         self.dropout1 = nn.Dropout(dropout)
+#         self.dropout2 = nn.Dropout(dropout)
+#         self.activation = getattr(F, activation)
+#         # self._reset_parameters()
+#
+#     def _reset_parameters(self):
+#         linear_init_(self.linear1)
+#         linear_init_(self.linear2)
+#
+#     @staticmethod
+#     def with_pos_embed(tensor, pos_embed):
+#         return tensor if pos_embed is None else tensor + pos_embed
+#
+#     def forward(self, src, src_mask=None, pos_embed=None):
+#         residual = src
+#         if self.normalize_before:
+#             src = self.norm1(src)
+#         q = k = self.with_pos_embed(src, pos_embed)
+#         src = self.self_attn(q, k, value=src, attn_mask=src_mask)
+#
+#         src = residual + self.dropout1(src)
+#         if not self.normalize_before:
+#             src = self.norm1(src)
+#
+#         residual = src
+#         if self.normalize_before:
+#             src = self.norm2(src)
+#         src = self.linear2(self.dropout(self.activation(self.linear1(src))))
+#         src = residual + self.dropout2(src)
+#         if not self.normalize_before:
+#             src = self.norm2(src)
+#         return src
+
+def _get_clones(module, N):
+    return nn.ModuleList([deepcopy(module) for _ in range(N)])
+
+# class TransformerEncoder(nn.Module):
+#     def __init__(self, encoder_layer, num_layers, norm=None):
+#         super(TransformerEncoder, self).__init__()
+#         self.layers = _get_clones(encoder_layer, num_layers)
+#         self.num_layers = num_layers
+#         self.norm = norm
+#
+#     def forward(self, src, src_mask=None, pos_embed=None):
+#         output = src
+#         for layer in self.layers:
+#             output = layer(output, src_mask=src_mask, pos_embed=pos_embed)
+#
+#         if self.norm is not None:
+#             output = self.norm(output)
+#
+#         return output
+# endregion

@@ -1,0 +1,291 @@
+"""Tests for fixed co-occurrence prior attribute heads."""
+
+from pathlib import Path
+
+import torch
+from torch import nn
+
+from ultralytics.nn.modules.head import (
+    CoOccurrencePriorBias,
+    CoOccurrencePriorChannelAttention,
+    CoOccurrencePriorCrossAttention,
+    CoOccurrencePriorDynamicGate,
+    CoOccurrencePriorAgreementTemperature,
+    CoOccurrencePriorConfidenceBlend,
+    CoOccurrencePriorLogitDiffusion,
+    CoOccurrencePriorLowRankAttention,
+    CoOccurrencePriorLogitBias,
+    CoOccurrencePriorLogitBlend,
+    CoOccurrencePriorLogitMLP,
+    CoOccurrencePriorMixtureHead,
+    CoOccurrencePriorStochasticBlend,
+    CoOccurrencePriorSpatialAttention,
+    CoOccurrenceTextureAttention,
+    CoOccurrenceAdaptiveLabelGCN,
+    CoOccurrenceDynamicLabelGCN,
+    CoOccurrenceLabelAttention,
+    CoOccurrenceLabelGCN,
+    CoOccurrenceLabelGCNThreshold,
+    CoOccurrenceMLGCN,
+    CoOccurrenceMLGCNThreshold,
+    CoOccurrenceMLGCNDirect,
+    CoOccurrenceMLGCNLearnable,
+    CoOccurrenceMLGAT,
+    CoOccurrenceMLSAGE,
+    CoOccurrenceMLTransformer,
+    CoOccurrenceMLGCNMoE,
+    CoOccurrenceGraphMeanField,
+    GCAFeatureLogitMultiHeadResidual,
+    GCAMultiHeadMarginResidual,
+    MDetect,
+)
+from scripts.train_mdet_experiments import _materialize_config
+
+
+def test_prior_heads_preserve_initial_attribute_predictions():
+    torch.manual_seed(0)
+    features = torch.randn(2, 32, 8, 8)
+    output_layer = nn.Conv2d(32, 20, 1)
+    baseline = output_layer(features)
+    heads = (
+        CoOccurrencePriorBias(10, 2),
+        CoOccurrencePriorChannelAttention(32, 10, 2),
+        CoOccurrencePriorSpatialAttention(32, 10, 2),
+        CoOccurrencePriorMixtureHead(32, 10, 2),
+        CoOccurrenceTextureAttention(32, 10, 2),
+    )
+
+    for head in heads:
+        output = head(baseline) if isinstance(head, CoOccurrencePriorBias) else head(
+            features, baseline, output_layer
+        )
+        torch.testing.assert_close(output, baseline, rtol=1e-5, atol=1e-5)
+
+
+def test_prior_heads_keep_multiscale_mdetect_output_shape():
+    torch.manual_seed(0)
+    features = [torch.randn(2, 32, 8, 8), torch.randn(2, 64, 4, 4), torch.randn(2, 128, 2, 2)]
+    for token in (
+        "com_prior_bias",
+        "com_prior_channel",
+        "com_prior_spatial",
+        "com_prior_moe",
+        "com_prior_texture",
+        "com_prior_logit_blend",
+        "com_prior_logit_bias",
+        "com_prior_logit_mlp",
+        "com_prior_cross_attention",
+        "com_prior_dynamic_gate",
+        "com_prior_logit_diffusion",
+        "com_prior_confidence_blend",
+        "com_prior_agreement_temperature",
+        "com_prior_stochastic_blend",
+        "com_prior_lowrank_attention",
+        "com_prior_label_gcn",
+        "com_prior_label_gcn_threshold",
+        "com_prior_adaptive_label_gcn",
+        "com_prior_dynamic_label_gcn",
+        "com_prior_label_attention",
+        "com_prior_mlgcn",
+        "com_prior_mlgcn_threshold",
+        "com_prior_mlgcn_direct",
+        "com_prior_mlgcn_learnable",
+        "com_prior_mlgat",
+        "com_prior_mlsage",
+        "com_prior_mltransformer",
+        "com_prior_graph_mean_field",
+        "com_prior_mlgcn_moe",
+    ):
+        head = MDetect(nc=2, na=10, nal=2, params=[False, None, token, False, None], ch=[32, 64, 128])
+        outputs = head([feature.clone() for feature in features])
+        assert [tuple(output.shape) for output in outputs] == [
+            (2, 86, 8, 8),
+            (2, 86, 4, 4),
+            (2, 86, 2, 2),
+        ]
+
+
+def test_direct_logit_prior_heads_are_finite_and_trainable():
+    torch.manual_seed(0)
+    logits = torch.randn(2, 20, 4, 4, requires_grad=True)
+    heads = (
+        CoOccurrencePriorLogitBlend(10, 2),
+        CoOccurrencePriorLogitBias(10, 2),
+        CoOccurrencePriorLogitMLP(10, 2),
+        CoOccurrencePriorCrossAttention(10, 2),
+        CoOccurrencePriorDynamicGate(10, 2),
+        CoOccurrencePriorLogitDiffusion(10, 2),
+        CoOccurrencePriorConfidenceBlend(10, 2),
+        CoOccurrencePriorAgreementTemperature(10, 2),
+        CoOccurrencePriorStochasticBlend(10, 2),
+        CoOccurrencePriorLowRankAttention(10, 2),
+    )
+
+    for head in heads:
+        output = head(logits)
+        assert output.shape == logits.shape
+        assert torch.isfinite(output).all()
+        output.square().mean().backward(retain_graph=True)
+        assert any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in head.parameters()
+        )
+
+
+def test_label_graph_heads_are_finite_and_trainable():
+    torch.manual_seed(0)
+    features = torch.randn(2, 32, 8, 8)
+    output_layer = nn.Conv2d(32, 20, 1)
+    baseline = output_layer(features)
+    heads = (
+        CoOccurrenceLabelGCN(32, 10, 2),
+        CoOccurrenceLabelGCNThreshold(32, 10, 2),
+        CoOccurrenceAdaptiveLabelGCN(32, 10, 2),
+        CoOccurrenceDynamicLabelGCN(32, 10, 2),
+        CoOccurrenceLabelAttention(32, 10, 2),
+        CoOccurrenceMLGCN(32, 10, 2),
+        CoOccurrenceMLGCNThreshold(32, 10, 2),
+        CoOccurrenceMLGCNDirect(32, 10, 2),
+        CoOccurrenceMLGCNLearnable(32, 10, 2),
+        CoOccurrenceMLGAT(32, 10, 2),
+        CoOccurrenceMLSAGE(32, 10, 2),
+        CoOccurrenceMLTransformer(32, 10, 2),
+        CoOccurrenceMLGCNMoE(32, 10, 2),
+        CoOccurrenceGraphMeanField(32, 10, 2),
+    )
+
+    for head in heads:
+        output = head(features, baseline, output_layer)
+        assert output.shape == baseline.shape
+        assert torch.isfinite(output).all()
+        output.square().mean().backward(retain_graph=True)
+        assert any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in head.parameters()
+        ), head.__class__.__name__
+
+
+def test_prior_stage2_materializes_head_and_matrix(tmp_path):
+    config = tmp_path / "prior.yaml"
+    matrix = tmp_path / "co_occurrence_matrix_train.csv"
+    config.write_text(
+        "head: [v10MDetect, [False, None, 'com_prior_channel', False, "
+        "/nfsv4/data/co_occurrence_matrix_train.csv]]\n",
+        encoding="utf-8",
+    )
+    matrix.write_text("placeholder", encoding="utf-8")
+
+    resolved = _materialize_config(
+        str(config),
+        str(matrix),
+        str(tmp_path / "generated"),
+        prior_type="label_gcn",
+    )
+    generated = Path(resolved).read_text(encoding="utf-8")
+    assert "com_prior_label_gcn" in generated
+    assert matrix.resolve().as_posix() in generated
+
+    resolved_mlgcn = _materialize_config(
+        str(config),
+        str(matrix),
+        str(tmp_path / "generated_mlgcn"),
+        prior_type="mlgcn_threshold",
+    )
+    generated_mlgcn = Path(resolved_mlgcn).read_text(encoding="utf-8")
+    assert "com_prior_mlgcn_threshold" in generated_mlgcn
+
+
+def test_mlgcn_uses_symmetric_graph_and_generates_classifier_weights():
+    torch.manual_seed(0)
+    head = CoOccurrenceMLGCN(32, 10, 2)
+    adjacency = head.adjacency
+    torch.testing.assert_close(adjacency, adjacency.transpose(0, 1))
+    classifiers = head._label_classifiers()
+    assert classifiers.shape == (10, 32)
+    assert torch.isfinite(classifiers).all()
+    assert classifiers.requires_grad
+
+
+def test_mha_margin_residual_supports_all_graph_operators():
+    torch.manual_seed(0)
+    logits = torch.randn(2, 20, 4, 4, requires_grad=True)
+    for gnn_type in ("gca", "gcn", "gat", "graphsage", "gin"):
+        head = GCAMultiHeadMarginResidual(10, 2, gnn_type=gnn_type)
+        output = head(logits)
+        assert output.shape == logits.shape
+        assert torch.isfinite(output).all()
+        output.square().mean().backward(retain_graph=True)
+        assert any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in head.parameters()
+        ), gnn_type
+
+
+def test_mha_margin_residual_materializes_each_gnn_token(tmp_path):
+    config = tmp_path / "mha_margin.yaml"
+    matrix = tmp_path / "co_occurrence_matrix_train.csv"
+    config.write_text(
+        "head: [v10MDetect, [False, None, 'com_gat_mha_margin_residual', False, "
+        "/nfsv4/data/co_occurrence_matrix_train.csv]]\n",
+        encoding="utf-8",
+    )
+    matrix.write_text("placeholder", encoding="utf-8")
+
+    for gnn_type, token in (
+        ("gca", "com_gat_mha_margin_residual"),
+        ("gcn", "gcn_mha_margin_residual"),
+        ("gat", "gat_mha_margin_residual"),
+        ("graphsage", "graphsage_mha_margin_residual"),
+        ("gin", "gin_mha_margin_residual"),
+    ):
+        resolved = _materialize_config(
+            str(config),
+            str(matrix),
+            str(tmp_path / f"generated_{gnn_type}"),
+            gnn_type=gnn_type,
+        )
+        generated = Path(resolved).read_text(encoding="utf-8")
+        assert token in generated
+
+
+def test_feature_logit_mha_margin_residual_supports_all_graph_operators():
+    torch.manual_seed(0)
+    features = torch.randn(2, 32, 4, 4, requires_grad=True)
+    logits = torch.randn(2, 20, 4, 4, requires_grad=True)
+    for gnn_type in ("gca", "gcn", "gat", "graphsage", "gin"):
+        head = GCAFeatureLogitMultiHeadResidual(32, 10, 2, gnn_type=gnn_type)
+        output = head(features, logits)
+        assert output.shape == logits.shape
+        assert torch.isfinite(output).all()
+        output.square().mean().backward(retain_graph=True)
+        assert any(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in head.parameters()
+        ), gnn_type
+
+
+def test_feature_logit_mha_margin_residual_materializes_each_gnn_token(tmp_path):
+    config = tmp_path / "feature_logit_mha_margin.yaml"
+    matrix = tmp_path / "co_occurrence_matrix_train.csv"
+    config.write_text(
+        "head: [v10MDetect, [False, None, 'com_gat_feature_logit_mha_margin_residual', False, "
+        "/nfsv4/data/co_occurrence_matrix_train.csv]]\n",
+        encoding="utf-8",
+    )
+    matrix.write_text("placeholder", encoding="utf-8")
+
+    for gnn_type, token in (
+        ("gca", "com_gat_feature_logit_mha_margin_residual"),
+        ("gcn", "gcn_feature_logit_mha_margin_residual"),
+        ("gat", "gat_feature_logit_mha_margin_residual"),
+        ("graphsage", "graphsage_feature_logit_mha_margin_residual"),
+        ("gin", "gin_feature_logit_mha_margin_residual"),
+    ):
+        resolved = _materialize_config(
+            str(config),
+            str(matrix),
+            str(tmp_path / f"generated_feature_logit_{gnn_type}"),
+            gnn_type=gnn_type,
+        )
+        generated = Path(resolved).read_text(encoding="utf-8")
+        assert token in generated
