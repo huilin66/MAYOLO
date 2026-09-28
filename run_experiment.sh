@@ -83,7 +83,10 @@ PURE_GCA_CONFIG="${PURE_GCA_CONFIG:-ultralytics/cfg/models/exp_ablation/yolov10x
 GIA_GCA_CONFIG="${GIA_GCA_CONFIG:-ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_5_7_GCA_margin_residual.yaml}"
 GIA_CONFIG="${GIA_CONFIG:-ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_5_7.yaml}"
 
-GNN_TYPES=(gcn gat graphsage gin)
+# The graph-operator ablation is performed only for Baseline+GCA on the
+# validation set. GIN is the operator retained for the later GIA+GCA model.
+GCA_OPERATOR_SWEEP=(gin gcn gat graphsage)
+FINAL_GCA_OPERATORS=(gin)
 # GIA position names used in the manuscript. The YAML files retain the
 # original insertion locations: layers 5/7, layer 10, and layer 22.
 GIA_POSITION_VARIANTS=(
@@ -110,12 +113,12 @@ Codes:
   e1         E1 w4 validation scan.
   e2.0       Baseline/GIA five-seed Stage1+Stage2 training.
   e2.1       GIA-backbone/decoder/head Stage1+Stage2 validation sweep.
-  e2.2       Pure Baseline+GCA, 4 graph operators x 5 seeds.
+  e2.2       Baseline+GCA graph-operator validation sweep, 4 operators x 5 seeds.
   e2.3       Baseline HO Test evaluation.
   e2.4       GIA HO Test evaluation.
-  e2.5       GIA+GCA Stage2, 4 graph operators x 5 seeds.
-  e2.6       Baseline+GCA HO Test evaluation.
-  e2.7       GIA+GCA HO Test evaluation (MAYOLO).
+  e2.5       GIA+GCA Stage2 using the selected GIN operator.
+  e2.6       Baseline+GCA-GIN HO Test evaluation.
+  e2.7       GIA+GCA-GIN HO Test evaluation (MAYOLO).
   e2.8       E2 performance profile for eight ablation models x five seeds.
   e3.train   Native YOLO/YOLO26 and MAYOLO size training.
   e3.eval    E3/E4 five-seed performance profile.
@@ -260,6 +263,8 @@ e21() {
 
 gca_train() {
   local label="$1" root="$2" config="$3" matrix_path="$4" stage1_key="$5"
+  shift 5
+  local -a operators=("$@")
   need "$DATA"; need "$config"; need "$matrix_path"
   require_weights_manifest
   local -a cmd=(
@@ -268,7 +273,7 @@ gca_train() {
     --imgsz "$IMGSZ" --batch "$BATCH" --workers "$WORKERS" --device "$DEVICE"
     --w4 "$W4"
     --stage1-epochs "$STAGE1_EPOCHS" --stage2-epochs "$STAGE2_EPOCHS"
-    --variant "margin_residual=$config" --gnn-types "${GNN_TYPES[@]}"
+    --variant "margin_residual=$config" --gnn-types "${operators[@]}"
     --seeds "${SEED_LIST[@]}" --com-path "$matrix_path" --skip-existing
   )
   local seed checkpoint
@@ -280,17 +285,17 @@ gca_train() {
 }
 
 e22() {
-  echo "[E2.2] pure Baseline+GCA: Cross matrix and four graph operators"
+  echo "[E2.2] Baseline+GCA graph-operator validation sweep: Cross matrix and four operators"
   gca_train E2_29_Baseline_GCA_pure_margin_residual_5seed_cross \
     runs/experiments/E2_29_Baseline_GCA_pure_margin_residual_5seed_cross \
-    "$PURE_GCA_CONFIG" "$COM_CROSS" baseline_stage1
+    "$PURE_GCA_CONFIG" "$COM_CROSS" baseline_stage1 "${GCA_OPERATOR_SWEEP[@]}"
 }
 
 e25() {
-  echo "[E2.5] GIA+GCA Stage2: Cross matrix and four graph operators"
+  echo "[E2.5] GIA+GCA Stage2: Cross matrix with the selected GIN operator"
   gca_train E2_28_GIA_v2_5_7_GCA_margin_residual_5seed_cross \
     runs/experiments/E2_28_GIA_v2_5_7_GCA_margin_residual_5seed_cross \
-    "$GIA_GCA_CONFIG" "$COM_CROSS" gia_stage1
+    "$GIA_GCA_CONFIG" "$COM_CROSS" gia_stage1 "${FINAL_GCA_OPERATORS[@]}"
 }
 
 eval_ho() {
@@ -322,12 +327,12 @@ e24() {
 }
 
 e26() {
-  echo "[E2.6] Baseline+GCA HO Test evaluation"
+  echo "[E2.6] Baseline+GCA-GIN HO Test evaluation"
   require_weights_manifest
   local root="${E2_GCA_HO_ROOT:-runs/experiments/E2_6_Baseline_GCA_HO}"
   COLLECTED=()
   local operator seed
-  for operator in "${GNN_TYPES[@]}"; do
+  for operator in "${FINAL_GCA_OPERATORS[@]}"; do
     for seed in "${SEED_LIST[@]}"; do
       COLLECTED+=("$(manifest_weight "gca_${operator}" "$seed")")
     done
@@ -337,12 +342,12 @@ e26() {
 }
 
 e27() {
-  echo "[E2.7] GIA+GCA HO Test evaluation (MAYOLO)"
+  echo "[E2.7] GIA+GCA-GIN HO Test evaluation (MAYOLO)"
   require_weights_manifest
   local root="${E2_GIA_GCA_HO_ROOT:-runs/experiments/E2_7_MAYOLO_HO}"
   COLLECTED=()
   local operator seed
-  for operator in "${GNN_TYPES[@]}"; do
+  for operator in "${FINAL_GCA_OPERATORS[@]}"; do
     for seed in "${SEED_LIST[@]}"; do
       COLLECTED+=("$(manifest_weight "gia_gca_${operator}" "$seed")")
     done
