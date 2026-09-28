@@ -84,17 +84,12 @@ GIA_GCA_CONFIG="${GIA_GCA_CONFIG:-ultralytics/cfg/models/exp_ablation/yolov10x_G
 GIA_CONFIG="${GIA_CONFIG:-ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_5_7.yaml}"
 
 GNN_TYPES=(gcn gat graphsage gin)
+# GIA position names used in the manuscript. The YAML files retain the
+# original insertion locations: layers 5/7, layer 10, and layer 22.
 GIA_POSITION_VARIANTS=(
-  "gia_6=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_6.yaml"
-  "gia_7=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_7.yaml"
-  "gia_8=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_8.yaml"
-  "gia_9=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_9.yaml"
-  "gia_10=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_10.yaml"
-  "gia_13=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_13.yaml"
-  "gia_16=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_16.yaml"
-  "gia_19=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_19.yaml"
-  "gia_22=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_22.yaml"
-  "gia=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_5_7.yaml"
+  "GIA-backbone=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_5_7.yaml"
+  "GIA-decoder=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_10.yaml"
+  "GIA-head=ultralytics/cfg/models/exp_ablation/yolov10x_GIA_v2_22.yaml"
 )
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
@@ -114,7 +109,7 @@ Codes:
   preflight  Check repository inputs and paths.
   e1         E1 w4 validation scan.
   e2.0       Baseline/GIA five-seed Stage1+Stage2 training.
-  e2.1       GIA position Stage1+Stage2 sweep.
+  e2.1       GIA-backbone/decoder/head Stage1+Stage2 validation sweep.
   e2.2       Pure Baseline+GCA, 4 graph operators x 5 seeds.
   e2.3       Baseline HO Test evaluation.
   e2.4       GIA HO Test evaluation.
@@ -246,7 +241,7 @@ e20() {
 }
 
 e21() {
-  echo "[E2.1] GIA position Stage1+Stage2 sweep"
+  echo "[E2.1] GIA-backbone/decoder/head Stage1+Stage2 validation sweep"
   need "$DATA"
   local seed variant
   for seed in "${SEED_LIST[@]}"; do
