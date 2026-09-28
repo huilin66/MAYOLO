@@ -110,7 +110,7 @@ EigenCAM requires explicit checkpoints:
 
 Codes:
   preflight  Check repository inputs and paths.
-  e1         E1 w4 validation scan.
+  e1         E1 five-seed w4 validation means for 0.0, 0.5 and 1.0.
   e2.0       Baseline/GIA five-seed Stage1+Stage2 training.
   e2.1       GIA-backbone/decoder/head Stage1+Stage2 validation sweep.
   e2.2       Baseline+GCA graph-operator validation sweep, 4 operators x 5 seeds.
@@ -219,14 +219,14 @@ preflight() {
 }
 
 e1() {
-  echo "[E1] w4 validation scan"
+  echo "[E1] five-seed w4 validation means: 0.0, 0.5 and 1.0"
   need "$DATA"; need "$MD_MODEL"
-  py scripts/train_mdet_experiments.py w4 \
+  py scripts/train_mdet_experiments.py w4-seeds \
     --data "$DATA" --model "$MD_MODEL" --pretrain "$PRETRAIN" \
-    --w4-values 0.25 0.5 0.75 1.0 1.25 1.5 \
+    --w4-values 0.0 0.5 1.0 --seeds "${SEED_LIST[@]}" \
     --stage1-epochs "$STAGE1_EPOCHS" --stage2-epochs "$STAGE2_EPOCHS" \
     --imgsz "$IMGSZ" --batch "$BATCH" --workers "$WORKERS" --device "$DEVICE" \
-    --project runs/experiments/E1_w4 --label E1_w4 --skip-existing
+    --project runs/experiments/E1_w4_5seed --label E1_w4_5seed --skip-existing
 }
 
 e20() {
