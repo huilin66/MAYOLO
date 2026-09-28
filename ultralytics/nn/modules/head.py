@@ -1,0 +1,3756 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Model head modules."""
+
+import copy
+import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.init import constant_, xavier_uniform_
+
+from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
+
+from .block import (
+    DFL,
+    BNContrastiveHead,
+    C2fCIB,
+    ContrastiveHead,
+    Proto,
+    RepNCSPELAN4,
+)
+from .conv import Conv, DWConv
+from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
+from .utils import bias_init_with_prob, linear_init
+
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "v10Detect", "v10Segment"
+
+# region added gat
+
+
+def _canonical_gnn_type(gnn_type):
+    """Normalize the former ``gca`` operator name to its new ``fga`` name."""
+    return "fga" if gnn_type == "gca" else gnn_type
+
+
+class GAT(nn.Module):
+    def __init__(
+        self,
+        input_chs,
+        output_chs,
+        att_type="com",
+        com_path=None,
+        proj=True,
+        res=False,
+        gated_res=False,
+        add_softmax=True,
+        drop_rate=0,
+        leaky_rate=0.1,
+        feature_ds=True,
+    ):
+        super().__init__()
+        self.input_chs = input_chs
+        self.output_chs = output_chs
+        self.att_type = att_type
+        self.com_path = com_path
+        self.proj = proj
+        self.res = res
+        self.gated_res = gated_res
+        self.add_softmax = add_softmax
+        self.drop_rate = drop_rate
+        self.leaky_rate = leaky_rate
+        self.feature_ds = feature_ds
+        self.proj_w = MLP(input_chs, output_chs * 2, output_chs, 2) if self.proj else nn.Identity()
+
+        if self.att_type == "mlp":
+            self.proj_a = nn.AdaptiveAvgPool1d(1)
+        elif self.att_type == "cos":
+            self.proj_a = self.proj_cos
+        elif self.att_type == "mlpr":
+            self.proj_a = MLP(output_chs * 2, output_chs // 2, 1, 2)
+        elif self.att_type == "mlpt":
+            self.proj_a = nn.AdaptiveAvgPool1d(1)
+        elif self.att_type == "cost":
+            self.proj_a = self.proj_cos
+        elif self.att_type == "com":
+            self.correlation = self.load_com(self.com_path)
+        else:
+            raise NotImplementedError("Attention type %s not implemented" % self.att_type)
+
+        self.leaky_relu = nn.LeakyReLU(leaky_rate)
+        self.dropout = nn.Dropout(self.drop_rate)
+        self.softmax = nn.Softmax(dim=1)
+        self.feature_down = nn.MaxPool1d(kernel_size=4, stride=4)
+        self.feature_up = nn.Upsample(scale_factor=4, mode="nearest")
+        self.gamma = nn.Parameter(torch.zeros(1, output_chs, 1, 1)) if gated_res else None
+
+    def load_com(self, com_path):
+        import pandas as pd
+
+        com = pd.read_csv(com_path, header=0, index_col=0)
+        com = com.to_numpy()
+        com = torch.tensor(com).float()
+        return com
+
+    def data_prepare(self, x):
+        b, n, c = x.shape
+        x_rep1 = x.tile((1, n, 1))
+        x_rep2 = torch.repeat_interleave(x, n, 1)
+        x_rep = torch.concat([x_rep1, x_rep2], dim=-1)
+        x_rep = x_rep.reshape((b, n, n, -1))
+        return x_rep
+
+    def proj_cos(self, features):
+        features_1 = features.unsqueeze(2)
+        features_2 = features.unsqueeze(1)
+
+        cosine_similarity_matrix = F.cosine_similarity(features_1, features_2, dim=-1)
+        return cosine_similarity_matrix
+
+    def forward(self, inputs):
+        b, c, h, w = inputs.shape
+        n = h * w
+
+        feature = inputs.view((b, c, n)).permute((0, 2, 1))
+        feature_proj = self.proj_w(feature)
+
+        if (hasattr(self, "feature_ds") and self.feature_ds) and feature_proj.shape[1] > 4000:
+            feature_down = self.feature_down(self.feature_down(feature_proj.permute((0, 2, 1)))).permute((0, 2, 1))
+        elif (hasattr(self, "feature_ds") and self.feature_ds) and feature_proj.shape[1] > 1000:
+            feature_down = self.feature_down(feature_proj.permute((0, 2, 1))).permute((0, 2, 1))
+        else:
+            feature_down = feature_proj
+
+        if self.att_type == "mlp":
+            feature_repeat = self.data_prepare(feature_down)  # size(b, c, c, 2n)
+            correlation = feature_repeat.mean(dim=-1).squeeze(-1)  # size(b, c, c)
+        elif self.att_type == "cos":
+            correlation = self.proj_a(feature_down).squeeze(-1)  # size(b, c, c)
+        elif self.att_type == "mlpr":
+            feature_repeat = self.data_prepare(feature_down)  # size(b, c, c, 2n)
+            correlation = self.proj_a(feature_repeat).squeeze(-1)  # size(b, c, c)
+        elif self.att_type == "mlpt":
+            feature_repeat = self.data_prepare(feature_proj.permute((0, 2, 1)))  # size(b, c, c, 2n)
+            correlation = feature_repeat.mean(dim=-1).squeeze(-1)  # size(b, c, c)
+        elif self.att_type == "cost":
+            correlation = self.proj_a(feature_proj.permute((0, 2, 1))).squeeze(-1)  # size(b, c, c)
+        else:
+            correlation = self.correlation.to(inputs.device).to(inputs.dtype)
+
+        correlation = self.leaky_relu(correlation)
+        attention = self.softmax(correlation) if self.add_softmax else correlation
+        attention = self.dropout(attention)
+
+        if self.att_type in ["mlp", "cos", "mlpr"]:
+            outputs = torch.matmul(attention, feature_down)
+            if feature_proj.shape[1] > 4000:
+                outputs = self.feature_up(self.feature_up(outputs.permute((0, 2, 1)))).permute((0, 2, 1))
+            elif feature_proj.shape[1] > 1000:
+                outputs = self.feature_up(outputs.permute((0, 2, 1))).permute((0, 2, 1))
+            else:
+                outputs = feature_proj
+        else:
+            outputs = torch.matmul(feature_proj, attention)
+
+        outputs = outputs.permute((0, 2, 1)).view((b, c, h, w))
+        if self.res:
+            outputs = inputs + self.gamma * outputs if self.gated_res else outputs + inputs
+        return outputs
+
+
+def _load_attribute_graph(com_path, num_nodes):
+    """Load a non-negative attribute graph and remove self-edges.
+
+    The graph is defined over attributes, not over spatial locations. When no
+    co-occurrence file is supplied, a fully connected graph is used so the
+    learned GAT variant remains usable as a feature-only label-dependency
+    model.
+    """
+    if com_path is None:
+        graph = torch.ones((num_nodes, num_nodes), dtype=torch.float32)
+    else:
+        import pandas as pd
+
+        graph = torch.tensor(pd.read_csv(com_path, header=0, index_col=0).to_numpy()).float()
+        if graph.shape != (num_nodes, num_nodes):
+            raise ValueError(
+                f"Expected an attribute graph with shape {(num_nodes, num_nodes)}, got {tuple(graph.shape)}"
+            )
+        graph = graph.clamp_min(0)
+    graph.fill_diagonal_(0)
+    return graph
+
+
+def _attribute_nodes(inputs, num_nodes):
+    """Convert BCHW attribute logits to per-pixel graph node features."""
+    batch, channels, height, width = inputs.shape
+    if channels != num_nodes:
+        raise RuntimeError(f"Expected {num_nodes} attribute channels, got {channels}")
+    return inputs.permute(0, 2, 3, 1).reshape(batch, height * width, num_nodes, 1)
+
+
+def _attribute_map(nodes, batch, channels, height, width):
+    """Convert per-pixel graph node features back to BCHW logits."""
+    return nodes.reshape(batch, height, width, channels).permute(0, 3, 1, 2).contiguous()
+
+
+def _scaled_dot_product_multihead_attention(attention, query, key, value):
+    """Run a compatible ``MultiheadAttention`` through PyTorch fused SDPA.
+
+    ``nn.MultiheadAttention`` can dispatch to SDPA, but the dispatch is hidden
+    inside the module and may change with PyTorch versions.  This small path
+    keeps the module's parameters while calling ``scaled_dot_product_attention``
+    explicitly.  On CUDA, PyTorch selects Flash-SDP when the dtype/device/head
+    shape are supported and falls back to another SDP kernel otherwise.
+
+    ``None`` means that the module configuration is not compatible with this
+    fast path; the caller then uses the reference MHA implementation.
+    """
+    if (
+        not query.is_cuda
+        or not key.is_cuda
+        or not value.is_cuda
+        or not hasattr(F, "scaled_dot_product_attention")
+        or not getattr(attention, "batch_first", False)
+        or not getattr(attention, "_qkv_same_embed_dim", False)
+        or getattr(attention, "bias_k", None) is not None
+        or getattr(attention, "bias_v", None) is not None
+        or getattr(attention, "add_zero_attn", False)
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or key.dtype != query.dtype
+        or value.dtype != query.dtype
+        or query.shape[-1] != attention.embed_dim
+        or key.shape[-1] != attention.embed_dim
+        or value.shape[-1] != attention.embed_dim
+    ):
+        return None
+
+    in_proj_weight = attention.in_proj_weight
+    if in_proj_weight is None:
+        return None
+    q_weight, k_weight, v_weight = in_proj_weight.chunk(3, dim=0)
+    if attention.in_proj_bias is None:
+        q_bias = k_bias = v_bias = None
+    else:
+        q_bias, k_bias, v_bias = attention.in_proj_bias.chunk(3, dim=0)
+
+    q = F.linear(query, q_weight, q_bias)
+    k = F.linear(key, k_weight, k_bias)
+    v = F.linear(value, v_weight, v_bias)
+    batch, query_length, _ = q.shape
+    key_length = k.shape[1]
+    num_heads = attention.num_heads
+    head_dim = attention.head_dim
+    q = q.reshape(batch, query_length, num_heads, head_dim).transpose(1, 2)
+    k = k.reshape(batch, key_length, num_heads, head_dim).transpose(1, 2)
+    v = v.reshape(batch, key_length, num_heads, head_dim).transpose(1, 2)
+
+    dropout_p = float(attention.dropout) if attention.training else 0.0
+    attended = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=False)
+    attended = attended.transpose(1, 2).contiguous().reshape(batch, query_length, attention.embed_dim)
+    return F.linear(attended, attention.out_proj.weight, attention.out_proj.bias)
+
+
+def _chunked_multihead_attention(attention, query, key, value, chunk_size=2048):
+    """Run attribute-token attention in bounded spatial batches.
+
+    P3 contains many spatial locations, so flattening ``B*H*W`` into one MHA
+    batch can exceed CUDA kernel launch limits even though the attribute
+    sequence itself is short.  Chunking only the flattened spatial batch keeps
+    the attention semantics unchanged and bounds temporary CUDA tensors.  For
+    CUDA half/bfloat16 inputs, each chunk first tries PyTorch's fused SDPA path
+    (Flash-SDP when supported) and transparently falls back to reference MHA.
+    """
+    outputs = []
+    use_fast_path = True
+    for start in range(0, query.shape[0], chunk_size):
+        end = start + chunk_size
+        query_chunk = query[start:end]
+        key_chunk = key[start:end]
+        value_chunk = value[start:end]
+        attended = None
+        if use_fast_path:
+            try:
+                attended = _scaled_dot_product_multihead_attention(
+                    attention, query_chunk, key_chunk, value_chunk
+                )
+            except (RuntimeError, NotImplementedError):
+                # Unsupported head shape/dtype/backend: use the numerically
+                # equivalent reference implementation for all later chunks.
+                use_fast_path = False
+        if attended is None:
+            attended = attention(query_chunk, key_chunk, value_chunk, need_weights=False)[0]
+        outputs.append(attended)
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
+class GraphGCN(nn.Module):
+    """Fixed-graph GCN over attribute logits with a zero-initialized residual gate."""
+
+    def __init__(self, input_chs, output_chs, com_path=None, hidden_chs=None, res=False):
+        super().__init__()
+        if input_chs != output_chs:
+            raise ValueError("GraphGCN requires input_chs == output_chs")
+        hidden_chs = hidden_chs or max(16, input_chs * 2)
+        graph = _load_attribute_graph(com_path, input_chs)
+        graph = graph + torch.eye(input_chs, dtype=graph.dtype)
+        degree = graph.sum(dim=-1).clamp_min(1e-6)
+        graph = degree.rsqrt().unsqueeze(1) * graph * degree.rsqrt().unsqueeze(0)
+        self.register_buffer("adjacency", graph)
+        self.node_in = nn.Linear(1, hidden_chs)
+        self.node_out = nn.Linear(hidden_chs, 1)
+        self.activation = nn.ReLU(inplace=True)
+        self.res = res
+        self.gamma = nn.Parameter(torch.zeros(1, output_chs, 1, 1))
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        nodes = _attribute_nodes(inputs, channels)
+        adjacency = self.adjacency.to(device=inputs.device, dtype=inputs.dtype)
+        aggregated = torch.einsum("ij,bsjf->bsif", adjacency, nodes)
+        outputs = self.node_out(self.activation(self.node_in(aggregated)))
+        outputs = _attribute_map(outputs.squeeze(-1), batch, channels, height, width)
+        return inputs + self.gamma * outputs if self.res else outputs
+
+
+class GraphGAT(nn.Module):
+    """Feature-dependent GAT with a zero-initialized residual gate."""
+
+    def __init__(self, input_chs, output_chs, com_path=None, hidden_chs=None, res=False, drop_rate=0.0):
+        super().__init__()
+        if input_chs != output_chs:
+            raise ValueError("GraphGAT requires input_chs == output_chs")
+        hidden_chs = hidden_chs or max(16, input_chs * 2)
+        graph = _load_attribute_graph(com_path, input_chs)
+        edge_mask = graph > 0
+        edge_mask.fill_diagonal_(True)
+        self.register_buffer("edge_mask", edge_mask)
+        self.node_proj = nn.Linear(1, hidden_chs, bias=False)
+        self.att_src = nn.Linear(hidden_chs, 1, bias=False)
+        self.att_dst = nn.Linear(hidden_chs, 1, bias=False)
+        self.node_out = nn.Linear(hidden_chs, 1)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(drop_rate)
+        self.res = res
+        self.gamma = nn.Parameter(torch.zeros(1, output_chs, 1, 1))
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        nodes = _attribute_nodes(inputs, channels)
+        hidden = self.node_proj(nodes)
+        scores = self.att_src(hidden).squeeze(-1).unsqueeze(-1) + self.att_dst(hidden).squeeze(-1).unsqueeze(-2)
+        scores = self.leaky_relu(scores)
+        mask = self.edge_mask.view(1, 1, channels, channels)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        attention = self.dropout(torch.softmax(scores, dim=-1))
+        aggregated = torch.einsum("bsij,bsjd->bsid", attention, hidden)
+        outputs = self.node_out(aggregated)
+        outputs = _attribute_map(outputs.squeeze(-1), batch, channels, height, width)
+        return inputs + self.gamma * outputs if self.res else outputs
+
+
+class GraphSAGE(nn.Module):
+    """Mean-aggregation GraphSAGE with a zero-initialized residual gate."""
+
+    def __init__(self, input_chs, output_chs, com_path=None, hidden_chs=None, res=False):
+        super().__init__()
+        if input_chs != output_chs:
+            raise ValueError("GraphSAGE requires input_chs == output_chs")
+        hidden_chs = hidden_chs or max(16, input_chs * 2)
+        graph = _load_attribute_graph(com_path, input_chs)
+        degree = graph.sum(dim=-1).clamp_min(1e-6)
+        graph = graph / degree.unsqueeze(-1)
+        self.register_buffer("adjacency", graph)
+        self.self_proj = nn.Linear(1, hidden_chs)
+        self.neighbor_proj = nn.Linear(1, hidden_chs)
+        self.node_out = nn.Linear(hidden_chs, 1)
+        self.activation = nn.ReLU(inplace=True)
+        self.res = res
+        self.gamma = nn.Parameter(torch.zeros(1, output_chs, 1, 1))
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        nodes = _attribute_nodes(inputs, channels)
+        adjacency = self.adjacency.to(device=inputs.device, dtype=inputs.dtype)
+        neighbors = torch.einsum("ij,bsjf->bsif", adjacency, nodes)
+        hidden = self.activation(self.self_proj(nodes) + self.neighbor_proj(neighbors))
+        outputs = self.node_out(hidden)
+        outputs = _attribute_map(outputs.squeeze(-1), batch, channels, height, width)
+        return inputs + self.gamma * outputs if self.res else outputs
+
+
+class GraphGIN(nn.Module):
+    """GIN-style sum aggregation with a zero-initialized residual gate."""
+
+    def __init__(self, input_chs, output_chs, com_path=None, hidden_chs=None, res=False):
+        super().__init__()
+        if input_chs != output_chs:
+            raise ValueError("GraphGIN requires input_chs == output_chs")
+        hidden_chs = hidden_chs or max(16, input_chs * 2)
+        graph = (_load_attribute_graph(com_path, input_chs) > 0).to(torch.float32)
+        self.register_buffer("adjacency", graph)
+        self.eps = nn.Parameter(torch.zeros(1))
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_chs),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_chs, 1),
+        )
+        self.res = res
+        self.gamma = nn.Parameter(torch.zeros(1, output_chs, 1, 1))
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        nodes = _attribute_nodes(inputs, channels)
+        adjacency = self.adjacency.to(device=inputs.device, dtype=inputs.dtype)
+        neighbors = torch.einsum("ij,bsjf->bsif", adjacency, nodes)
+        outputs = self.mlp((1 + self.eps) * nodes + neighbors)
+        outputs = _attribute_map(outputs.squeeze(-1), batch, channels, height, width)
+        return inputs + self.gamma * outputs if self.res else outputs
+
+
+class GCAMarginResidual(nn.Module):
+    """Multi-class-aware residual graph propagation for mdet attributes.
+
+    The current mdet layout represents each attribute with ``nal`` mutually
+    exclusive logits.  With ``nal == 2`` the decision variable is the risk
+    margin ``logit(1) - logit(0)``.  This module propagates that margin through
+    a train-only attribute graph and reconstructs the logits while preserving
+    their mean.  ``gnn_type`` selects the graph aggregator so FGA and the
+    reviewer-requested GCN/GAT/GraphSAGE/GIN comparison share exactly the same
+    multiclass-aware residual interface.
+    """
+
+    expects_multiclass = True
+    supported_gnn_types = {"fga", "gcn", "gat", "graphsage", "gin"}
+
+    def __init__(self, na, nal, com_path=None, hidden_chs=None, gate_init=0.1, gnn_type="fga"):
+        super().__init__()
+        self.na = int(na)
+        self.nal = int(nal)
+        self.gnn_type = _canonical_gnn_type(gnn_type)
+        if self.na < 1 or self.nal < 2:
+            raise ValueError("GCAMarginResidual requires at least one attribute and nal >= 2")
+        if self.gnn_type not in self.supported_gnn_types:
+            raise ValueError(f"Unsupported margin graph type: {self.gnn_type}")
+
+        hidden_chs = hidden_chs or max(16, self.na * 2)
+        graph = _load_attribute_graph(com_path, self.na)
+        eye = torch.eye(self.na, dtype=graph.dtype)
+
+        if self.gnn_type == "fga":
+            # Fixed Graph Aggregation (the former GCA operator): row-wise
+            # softmax over a train-only
+            # co-occurrence matrix, including self information.  A directed
+            # conditional P(j|i) matrix can be supplied by generate_com.py.
+            self.register_buffer("adjacency", torch.softmax(graph + eye, dim=-1))
+            self.node_in = nn.Linear(1, hidden_chs)
+            self.node_out = nn.Linear(hidden_chs, 1)
+            self.activation = nn.GELU()
+        elif self.gnn_type == "gcn":
+            normalized = graph + eye
+            degree = normalized.sum(dim=-1).clamp_min(1e-6)
+            normalized = degree.rsqrt().unsqueeze(1) * normalized * degree.rsqrt().unsqueeze(0)
+            self.register_buffer("adjacency", normalized)
+            self.node_in = nn.Linear(1, hidden_chs)
+            self.node_out = nn.Linear(hidden_chs, 1)
+            self.activation = nn.GELU()
+        elif self.gnn_type == "gat":
+            edge_mask = graph > 0
+            edge_mask.fill_diagonal_(True)
+            self.register_buffer("edge_mask", edge_mask)
+            self.node_proj = nn.Linear(1, hidden_chs, bias=False)
+            self.att_src = nn.Linear(hidden_chs, 1, bias=False)
+            self.att_dst = nn.Linear(hidden_chs, 1, bias=False)
+            self.node_out = nn.Linear(hidden_chs, 1)
+            self.activation = nn.GELU()
+            self.leaky_relu = nn.LeakyReLU(0.2)
+        elif self.gnn_type == "graphsage":
+            neighbors = graph.clone()
+            degree = neighbors.sum(dim=-1).clamp_min(1e-6)
+            self.register_buffer("adjacency", neighbors / degree.unsqueeze(-1))
+            self.self_proj = nn.Linear(1, hidden_chs)
+            self.neighbor_proj = nn.Linear(1, hidden_chs)
+            self.node_out = nn.Linear(hidden_chs, 1)
+            self.activation = nn.GELU()
+        else:  # gin
+            self.register_buffer("adjacency", (graph > 0).to(graph.dtype))
+            self.eps = nn.Parameter(torch.zeros(1))
+            self.mlp = nn.Sequential(
+                nn.Linear(1, hidden_chs),
+                nn.GELU(),
+                nn.Linear(hidden_chs, 1),
+            )
+
+        # A non-zero gate lets both the graph module and its gate receive
+        # useful gradients from the first stage-2 update.
+        self.gamma = nn.Parameter(torch.full((1, self.na, 1, 1), float(gate_init)))
+
+    def _graph_message(self, values):
+        """Return one graph message for BCHW scalar attribute values."""
+        batch, channels, height, width = values.shape
+        if channels != self.na:
+            raise RuntimeError(f"Expected {self.na} attribute channels, got {channels}")
+
+        # Checkpoints created before the FGA rename retain ``gnn_type='gca'``
+        # on the serialized module.  Canonicalize at runtime as well as in
+        # ``__init__`` because unpickling an existing module does not rerun
+        # its constructor.
+        gnn_type = _canonical_gnn_type(self.gnn_type)
+        nodes = values.permute(0, 2, 3, 1).reshape(batch, height * width, self.na)
+        if gnn_type in {"fga", "gcn"}:
+            adjacency = self.adjacency.to(device=values.device, dtype=values.dtype)
+            hidden = self.activation(self.node_in(nodes.unsqueeze(-1)))
+            # Keep the direct Eq. (10)-style graph message as a strong prior;
+            # the learned projection refines it for this dataset.
+            direct_message = torch.einsum("ij,bnj->bni", adjacency, nodes)
+            aggregated = torch.einsum("ij,bnjd->bnid", adjacency, hidden)
+            message = direct_message + self.node_out(aggregated).squeeze(-1)
+        elif gnn_type == "gat":
+            hidden = self.activation(self.node_proj(nodes.unsqueeze(-1)))
+            src = self.att_src(hidden).squeeze(-1)
+            dst = self.att_dst(hidden).squeeze(-1)
+            scores = self.leaky_relu(src.unsqueeze(-1) + dst.unsqueeze(-2))
+            mask = self.edge_mask.view(1, 1, self.na, self.na)
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            attention = torch.softmax(scores, dim=-1)
+            direct_message = torch.einsum("bnij,bnj->bni", attention, nodes)
+            aggregated = torch.einsum("bnij,bnjd->bnid", attention, hidden)
+            message = direct_message + self.node_out(aggregated).squeeze(-1)
+        elif gnn_type == "graphsage":
+            adjacency = self.adjacency.to(device=values.device, dtype=values.dtype)
+            neighbors = torch.einsum("ij,bnj->bni", adjacency, nodes)
+            hidden = self.activation(
+                self.self_proj(nodes.unsqueeze(-1)) + self.neighbor_proj(neighbors.unsqueeze(-1))
+            )
+            message = neighbors + self.node_out(hidden).squeeze(-1)
+        else:  # gin
+            adjacency = self.adjacency.to(device=values.device, dtype=values.dtype)
+            neighbors = torch.einsum("ij,bnj->bni", adjacency, nodes)
+            message = neighbors + self.mlp(((1 + self.eps) * nodes + neighbors).unsqueeze(-1)).squeeze(-1)
+        return message.reshape(batch, height, width, self.na).permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+
+        logits = inputs.reshape(batch, self.na, self.nal, height, width)
+        center = logits.mean(dim=2, keepdim=True)
+
+        if self.nal == 2:
+            margin = logits[:, :, 1] - logits[:, :, 0]
+            margin = self._pre_graph_margin(margin)
+            message = self._graph_message(margin)
+            updated_margin = margin + self.gamma * message
+            outputs = torch.stack(
+                (center[:, :, 0] - 0.5 * updated_margin, center[:, :, 0] + 0.5 * updated_margin), dim=2
+            )
+        else:
+            # General nal fallback: center each attribute's logits and apply
+            # the same graph independently to every level.
+            centered = logits - center
+            level_values = centered.permute(0, 2, 1, 3, 4).reshape(batch * self.nal, self.na, height, width)
+            level_values = self._pre_graph_margin(level_values)
+            messages = self._graph_message(level_values)
+            messages = messages.reshape(batch, self.nal, self.na, height, width).permute(0, 2, 1, 3, 4)
+            outputs = logits + self.gamma.unsqueeze(2) * messages
+
+        return outputs.reshape(batch, expected_channels, height, width)
+
+    def _pre_graph_margin(self, margin):
+        """Optionally transform per-attribute margins before graph propagation."""
+        return margin
+
+
+class GCAMultiHeadMarginResidual(GCAMarginResidual):
+    """Multi-head self-attention followed by multiclass-aware graph propagation.
+
+    The attention sequence is the set of attribute nodes at each spatial
+    location.  A scalar margin is projected to an attention embedding, mixed
+    across attributes with ``nn.MultiheadAttention``, and projected back to a
+    scalar residual margin before the selected graph operator runs.  The
+    zero-initialized output projection keeps the new branch identity-like at
+    initialization while still allowing it to learn during direct Stage2
+    training.
+    """
+
+    def __init__(
+        self,
+        na,
+        nal,
+        com_path=None,
+        hidden_chs=None,
+        gate_init=0.1,
+        gnn_type="fga",
+        attention_chs=32,
+        attention_heads=4,
+        attention_dropout=0.0,
+    ):
+        super().__init__(
+            na,
+            nal,
+            com_path=com_path,
+            hidden_chs=hidden_chs,
+            gate_init=gate_init,
+            gnn_type=gnn_type,
+        )
+        attention_chs = int(attention_chs)
+        attention_heads = int(attention_heads)
+        if attention_heads < 1:
+            raise ValueError(f"attention_heads must be positive, got {attention_heads}")
+        if attention_chs < 1 or attention_chs % attention_heads != 0:
+            raise ValueError(
+                "attention_chs must be positive and divisible by attention_heads "
+                f"(got attention_chs={attention_chs}, attention_heads={attention_heads})"
+            )
+
+        self.attention_chs = attention_chs
+        self.attention_heads = attention_heads
+        self.attention_input = nn.Linear(1, attention_chs)
+        self.attention_norm = nn.LayerNorm(attention_chs)
+        self.multihead_attention = nn.MultiheadAttention(
+            embed_dim=attention_chs,
+            num_heads=attention_heads,
+            dropout=float(attention_dropout),
+            batch_first=True,
+        )
+        self.attention_output = nn.Linear(attention_chs, 1)
+        self.attention_gate = nn.Parameter(torch.full((1, self.na, 1, 1), float(gate_init)))
+        nn.init.zeros_(self.attention_output.weight)
+        nn.init.zeros_(self.attention_output.bias)
+
+    def _pre_graph_margin(self, margin):
+        """Mix attribute margins at each pixel before graph propagation."""
+        batch, channels, height, width = margin.shape
+        if channels != self.na:
+            raise RuntimeError(f"Expected {self.na} attribute channels, got {channels}")
+
+        # Each pixel is one sequence and each attribute is one token.  This
+        # avoids attention over the large spatial dimension while allowing
+        # every attribute to exchange context with the other attributes.
+        tokens = margin.permute(0, 2, 3, 1).reshape(-1, self.na, 1)
+        hidden = self.attention_input(tokens)
+        normalized = self.attention_norm(hidden)
+        attended = _chunked_multihead_attention(self.multihead_attention, normalized, normalized, normalized)
+        attended = attended + hidden
+        delta = self.attention_output(attended).squeeze(-1)
+        delta = delta.reshape(batch, height, width, self.na).permute(0, 3, 1, 2).contiguous()
+        gate = self.attention_gate.to(device=margin.device, dtype=margin.dtype)
+        return margin + gate * delta
+
+
+class GCAFeatureLogitMultiHeadResidual(nn.Module):
+    """Feature-logit cross-attention followed by margin-residual graph refinement.
+
+    The shared attribute head exposes a visual feature map immediately before
+    its final attribute-logit convolution.  This module turns that map into
+    one visual token per attribute and uses it as the query in cross-attention
+    over the corresponding attribute-logit tokens.  The resulting residual
+    logits are then passed to the selected multiclass-aware graph operator.
+    """
+
+    expects_features = True
+    supported_gnn_types = GCAMarginResidual.supported_gnn_types
+
+    def __init__(
+        self,
+        channels,
+        na,
+        nal,
+        com_path=None,
+        hidden_chs=None,
+        gate_init=0.1,
+        gnn_type="fga",
+        attention_chs=32,
+        attention_heads=4,
+        attention_dropout=0.0,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.na = int(na)
+        self.nal = int(nal)
+        if self.channels < 1 or self.na < 1 or self.nal < 2:
+            raise ValueError("GCAFeatureLogitMultiHeadResidual requires positive channels/na and nal >= 2")
+        gnn_type = _canonical_gnn_type(gnn_type)
+        if gnn_type not in self.supported_gnn_types:
+            raise ValueError(f"Unsupported feature-logit graph type: {gnn_type}")
+
+        attention_chs = int(attention_chs)
+        attention_heads = int(attention_heads)
+        if attention_heads < 1:
+            raise ValueError(f"attention_heads must be positive, got {attention_heads}")
+        if attention_chs < 1 or attention_chs % attention_heads != 0:
+            raise ValueError(
+                "attention_chs must be positive and divisible by attention_heads "
+                f"(got attention_chs={attention_chs}, attention_heads={attention_heads})"
+            )
+
+        self.attention_chs = attention_chs
+        self.attention_heads = attention_heads
+        self.feature_project = nn.Conv2d(self.channels, self.na * attention_chs, kernel_size=1)
+        self.feature_norm = nn.LayerNorm(attention_chs)
+        self.logit_input = nn.Linear(self.nal, attention_chs)
+        self.logit_norm = nn.LayerNorm(attention_chs)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=attention_chs,
+            num_heads=attention_heads,
+            dropout=float(attention_dropout),
+            batch_first=True,
+        )
+        self.attention_output = nn.Linear(attention_chs, self.nal)
+        self.attention_gate = nn.Parameter(torch.full((1, self.na, 1, 1), float(gate_init)))
+        nn.init.zeros_(self.attention_output.weight)
+        nn.init.zeros_(self.attention_output.bias)
+
+        # Reuse exactly the same graph implementation as the logits-only
+        # MHA experiment so the only new factor is the feature-logit fusion.
+        self.graph = GCAMarginResidual(
+            self.na,
+            self.nal,
+            com_path=com_path,
+            hidden_chs=hidden_chs,
+            gate_init=gate_init,
+            gnn_type=gnn_type,
+        )
+
+    def forward(self, features, logits, output_layer=None):
+        """Fuse feature/logit attribute tokens and apply the selected graph."""
+        del output_layer
+        batch, channels, height, width = features.shape
+        expected_channels = self.na * self.nal
+        if channels != self.channels:
+            raise RuntimeError(f"Expected {self.channels} feature channels, got {channels}")
+        if logits.shape != (batch, expected_channels, height, width):
+            raise RuntimeError(
+                f"Expected logits shape {(batch, expected_channels, height, width)}, got {tuple(logits.shape)}"
+            )
+
+        # One sequence per pixel; the sequence length is the number of
+        # attributes, not the number of spatial positions.
+        visual_tokens = self.feature_project(features)
+        visual_tokens = visual_tokens.reshape(batch, self.na, self.attention_chs, height * width)
+        visual_tokens = visual_tokens.permute(0, 3, 1, 2).contiguous()
+        visual_tokens = self.feature_norm(visual_tokens)
+
+        logit_tokens = logits.reshape(batch, self.na, self.nal, height * width)
+        logit_tokens = logit_tokens.permute(0, 3, 1, 2).contiguous()
+        logit_tokens = self.logit_norm(self.logit_input(logit_tokens))
+
+        query = visual_tokens.reshape(batch * height * width, self.na, self.attention_chs)
+        key_value = logit_tokens.reshape(batch * height * width, self.na, self.attention_chs)
+        attended = _chunked_multihead_attention(self.cross_attention, query, key_value, key_value)
+        fused = query + attended
+        delta = self.attention_output(fused)
+        delta = delta.reshape(batch, height, width, self.na, self.nal).permute(0, 3, 4, 1, 2).contiguous()
+
+        visual_logits = logits.reshape(batch, self.na, self.nal, height, width)
+        gate = self.attention_gate.to(device=logits.device, dtype=logits.dtype).unsqueeze(2)
+        fused_logits = visual_logits + gate * delta
+        return self.graph(fused_logits.reshape(batch, expected_channels, height, width))
+
+
+class GCAContextResidual(nn.Module):
+    """Confidence-gated graph-context residual correction for mdet logits.
+
+    ``GCAMarginResidual`` directly adds a graph message to the attribute
+    margin.  That can amplify a wrong but confident attribute and is
+    especially sensitive to noisy or overly dense co-occurrence matrices.
+    This variant treats the graph output as context instead:
+
+    1. convert each binary attribute margin to a bounded signal;
+    2. aggregate confident source attributes with the directed graph;
+    3. calculate a context-vs-self correction and suppress it for confident
+       target predictions;
+    4. refine the correction with a small two-layer fusion MLP; and
+    5. add the bounded correction through a learnable residual gate.
+
+    ``gnn_type`` selects the graph operator while all other parts remain
+    unchanged, making the reviewer-requested FGA/GCN/GAT/GraphSAGE/GIN
+    comparison controlled and directly comparable.  The row of the matrix is
+    the target attribute and the column is the source attribute, so a
+    conditional matrix ``P(source | target)`` can be used directly.
+    """
+
+    expects_multiclass = True
+    supported_gnn_types = {"fga", "gcn", "gat", "graphsage", "gin"}
+
+    def __init__(
+        self,
+        na,
+        nal,
+        com_path=None,
+        hidden_chs=None,
+        gate_init=0.1,
+        temperature=0.5,
+        margin_scale=2.0,
+        gnn_type="fga",
+    ):
+        super().__init__()
+        self.na = int(na)
+        self.nal = int(nal)
+        self.gnn_type = _canonical_gnn_type(str(gnn_type))
+        self.margin_scale = float(margin_scale)
+        if self.na < 1 or self.nal < 2:
+            raise ValueError("GCAContextResidual requires at least one attribute and nal >= 2")
+        if self.gnn_type not in self.supported_gnn_types:
+            raise ValueError(f"Unsupported context graph type: {self.gnn_type}")
+        if temperature <= 0:
+            raise ValueError("GCAContextResidual temperature must be positive")
+        if self.margin_scale <= 0:
+            raise ValueError("GCAContextResidual margin_scale must be positive")
+
+        hidden_chs = hidden_chs or max(16, self.na * 2)
+        self.hidden_chs = int(hidden_chs)
+        self.temperature = float(temperature)
+        graph = _load_attribute_graph(com_path, self.na)
+        eye = torch.eye(self.na, dtype=graph.dtype)
+        if self.gnn_type == "fga":
+            adjacency = torch.softmax((graph + eye) / self.temperature, dim=-1)
+            self.register_buffer("adjacency", adjacency)
+        elif self.gnn_type == "gcn":
+            adjacency = graph + eye
+            degree = adjacency.sum(dim=-1).clamp_min(1e-6)
+            adjacency = degree.rsqrt().unsqueeze(1) * adjacency * degree.rsqrt().unsqueeze(0)
+            self.register_buffer("adjacency", adjacency)
+            self.gnn_in = nn.Linear(1, self.hidden_chs)
+            self.gnn_out = nn.Linear(self.hidden_chs, 1)
+            self.activation = nn.GELU()
+            nn.init.zeros_(self.gnn_out.weight)
+            nn.init.zeros_(self.gnn_out.bias)
+        elif self.gnn_type == "gat":
+            edge_mask = graph > 0
+            edge_mask.fill_diagonal_(True)
+            self.register_buffer("edge_mask", edge_mask)
+            self.gnn_proj = nn.Linear(1, self.hidden_chs, bias=False)
+            self.att_src = nn.Linear(self.hidden_chs, 1, bias=False)
+            self.att_dst = nn.Linear(self.hidden_chs, 1, bias=False)
+            self.gnn_out = nn.Linear(self.hidden_chs, 1)
+            self.activation = nn.GELU()
+            self.leaky_relu = nn.LeakyReLU(0.2)
+            nn.init.zeros_(self.gnn_out.weight)
+            nn.init.zeros_(self.gnn_out.bias)
+        elif self.gnn_type == "graphsage":
+            adjacency = graph
+            degree = adjacency.sum(dim=-1).clamp_min(1e-6)
+            self.register_buffer("adjacency", adjacency / degree.unsqueeze(-1))
+            self.self_proj = nn.Linear(1, self.hidden_chs)
+            self.neighbor_proj = nn.Linear(1, self.hidden_chs)
+            self.gnn_out = nn.Linear(self.hidden_chs, 1)
+            self.activation = nn.GELU()
+            nn.init.zeros_(self.gnn_out.weight)
+            nn.init.zeros_(self.gnn_out.bias)
+        else:  # gin
+            adjacency = (graph > 0).to(graph.dtype)
+            self.register_buffer("adjacency", adjacency)
+            self.eps = nn.Parameter(torch.zeros(1))
+            self.gin_mlp = nn.Sequential(
+                nn.Linear(1, self.hidden_chs),
+                nn.GELU(),
+                nn.Linear(self.hidden_chs, 1),
+            )
+            nn.init.zeros_(self.gin_mlp[-1].weight)
+            nn.init.zeros_(self.gin_mlp[-1].bias)
+
+        # [self signal, graph context, disagreement, source/target confidence]
+        # gives the module a small, explicit fusion stage without changing the
+        # detector or segmentation branches.
+        self.fusion = nn.Sequential(
+            nn.Linear(4, self.hidden_chs),
+            nn.GELU(),
+            nn.Linear(hidden_chs, 1),
+        )
+        # Start from the deterministic graph correction.  The learned part is
+        # introduced only after its last layer receives a useful gradient.
+        nn.init.zeros_(self.fusion[-1].weight)
+        nn.init.zeros_(self.fusion[-1].bias)
+        self.gamma = nn.Parameter(torch.full((1, self.na, 1, 1), float(gate_init)))
+
+    def _aggregate_context(self, signal, confidence):
+        """Apply the selected GNN operator to per-pixel attribute signals."""
+        if self.gnn_type in {"fga", "gcn", "graphsage"}:
+            adjacency = self.adjacency.to(device=signal.device, dtype=signal.dtype)
+            weights = adjacency.view(1, 1, self.na, self.na) * confidence.unsqueeze(-2)
+            context = (weights * signal.unsqueeze(-2)).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1e-6)
+            if self.gnn_type == "gcn":
+                hidden = self.activation(self.gnn_in(signal.unsqueeze(-1)))
+                aggregated = torch.einsum("ij,bnjd->bnid", adjacency, hidden)
+                context = context + self.gnn_out(aggregated).squeeze(-1)
+            elif self.gnn_type == "graphsage":
+                neighbors = context
+                hidden = self.activation(
+                    self.self_proj(signal.unsqueeze(-1)) + self.neighbor_proj(neighbors.unsqueeze(-1))
+                )
+                context = context + self.gnn_out(hidden).squeeze(-1)
+            return torch.tanh(context)
+
+        if self.gnn_type == "gat":
+            hidden = self.activation(self.gnn_proj(signal.unsqueeze(-1)))
+            src = self.att_src(hidden).squeeze(-1)
+            dst = self.att_dst(hidden).squeeze(-1)
+            scores = self.leaky_relu(src.unsqueeze(-1) + dst.unsqueeze(-2))
+            mask = self.edge_mask.view(1, 1, self.na, self.na)
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            attention = torch.softmax(scores, dim=-1) * confidence.unsqueeze(-2)
+            attention = attention / attention.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            direct = torch.einsum("bnij,bnj->bni", attention, signal)
+            aggregated = torch.einsum("bnij,bnjd->bnid", attention, hidden)
+            context = direct + self.gnn_out(aggregated).squeeze(-1)
+            return torch.tanh(context)
+
+        # GIN uses an unnormalized sum and a learnable epsilon, followed by a
+        # node MLP.  Scale the direct signal by node degree to keep its range
+        # comparable with the other operators before applying tanh.
+        adjacency = self.adjacency.to(device=signal.device, dtype=signal.dtype)
+        neighbors = torch.einsum("ij,bnj->bni", adjacency, signal * confidence)
+        degree = adjacency.sum(dim=-1).view(1, 1, self.na).clamp_min(1.0)
+        gin_input = (1.0 + self.eps) * signal + neighbors
+        direct = gin_input / (1.0 + degree)
+        context = direct + self.gin_mlp(gin_input.unsqueeze(-1)).squeeze(-1)
+        return torch.tanh(context)
+
+    def _context_components(self, values):
+        """Return bounded local/context signals and detached confidences."""
+        batch, channels, height, width = values.shape
+        if channels != self.na:
+            raise RuntimeError(f"Expected {self.na} attribute channels, got {channels}")
+
+        nodes = values.permute(0, 2, 3, 1).reshape(batch, height * width, self.na)
+        signal = torch.tanh(nodes / self.margin_scale)
+        # Confident source nodes should contribute more, while the detached
+        # confidence prevents the graph branch from gaming its own gate.
+        confidence = torch.sigmoid(nodes.abs() / self.margin_scale).detach()
+        context = self._aggregate_context(signal, confidence)
+        return signal, context, confidence, (batch, height, width)
+
+    def _graph_message(self, values):
+        """Return a bounded, confidence-gated graph correction for BCHW values."""
+        signal, context, target_confidence, (batch, height, width) = self._context_components(values)
+
+        # Only uncertain target margins should be corrected aggressively. This
+        # limits false-positive propagation from a noisy fixed graph.
+        disagreement = (context - signal) * (1.0 - target_confidence)
+        features = torch.stack((signal, context, disagreement, target_confidence), dim=-1)
+        learned = self.fusion(features).squeeze(-1)
+        message = torch.tanh(disagreement + learned)
+        return message.reshape(batch, height, width, self.na).permute(0, 3, 1, 2).contiguous()
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+
+        logits = inputs.reshape(batch, self.na, self.nal, height, width)
+        center = logits.mean(dim=2, keepdim=True)
+        if self.nal == 2:
+            margin = logits[:, :, 1] - logits[:, :, 0]
+            correction = self._graph_message(margin)
+            updated_margin = margin + self.gamma * correction
+            outputs = torch.stack(
+                (center[:, :, 0] - 0.5 * updated_margin, center[:, :, 0] + 0.5 * updated_margin), dim=2
+            )
+        else:
+            centered = logits - center
+            level_values = centered.permute(0, 2, 1, 3, 4).reshape(batch * self.nal, self.na, height, width)
+            corrections = self._graph_message(level_values)
+            corrections = corrections.reshape(batch, self.nal, self.na, height, width).permute(0, 2, 1, 3, 4)
+            outputs = logits + self.gamma.unsqueeze(2) * corrections
+
+        return outputs.reshape(batch, expected_channels, height, width)
+
+
+class GCAAdaptiveResidual(GCAContextResidual):
+    """Learn an attribute-wise local/context mixture before residual writing."""
+
+    def __init__(self, *args, initial_local_weight=0.75, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not 0.0 < initial_local_weight < 1.0:
+            raise ValueError("initial_local_weight must be in (0, 1)")
+        nn.init.zeros_(self.fusion[-1].weight)
+        nn.init.constant_(self.fusion[-1].bias, math.log(initial_local_weight / (1.0 - initial_local_weight)))
+
+    def _graph_message(self, values):
+        """Return an adaptive convex local/context correction."""
+        signal, context, confidence, (batch, height, width) = self._context_components(values)
+        disagreement = context - signal
+        features = torch.stack((signal, context, disagreement, confidence), dim=-1)
+        local_weight = torch.sigmoid(self.fusion(features).squeeze(-1))
+        fused = local_weight * signal + (1.0 - local_weight) * context
+        message = torch.tanh((fused - signal) * (1.0 - confidence))
+        return message.reshape(batch, height, width, self.na).permute(0, 3, 1, 2).contiguous()
+
+
+class GCATwoHopResidual(GCAContextResidual):
+    """Use one- and two-hop graph context while retaining a residual shortcut."""
+
+    def _graph_message(self, values):
+        """Return a bounded correction from a mixture of one- and two-hop context."""
+        signal, context_one, confidence, (batch, height, width) = self._context_components(values)
+        context_two = self._aggregate_context(context_one, confidence)
+        context = 0.5 * (context_one + context_two)
+        disagreement = (context - signal) * (1.0 - confidence)
+        features = torch.stack((signal, context_one, context_two, confidence), dim=-1)
+        learned = self.fusion(features).squeeze(-1)
+        message = torch.tanh(disagreement + learned)
+        return message.reshape(batch, height, width, self.na).permute(0, 3, 1, 2).contiguous()
+
+
+class GCAConvAdapterResidual(GCAContextResidual):
+    """Add a small 1x1 attribute adapter alongside confidence-gated GCA."""
+
+    def __init__(self, *args, hidden_chs=None, **kwargs):
+        super().__init__(*args, hidden_chs=hidden_chs, **kwargs)
+        hidden_chs = hidden_chs or max(16, self.na * 2)
+        self.local_adapter = nn.Sequential(
+            nn.Conv2d(self.na, hidden_chs, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_chs, self.na, kernel_size=1),
+        )
+        nn.init.zeros_(self.local_adapter[-1].weight)
+        nn.init.zeros_(self.local_adapter[-1].bias)
+
+    def _graph_message(self, values):
+        """Return GCA correction plus a bounded local 1x1 attribute adapter."""
+        graph_message = super()._graph_message(values)
+        signal = torch.tanh(values / self.margin_scale)
+        confidence = torch.sigmoid(values.abs() / self.margin_scale).detach()
+        local_message = self.local_adapter(signal) * (1.0 - confidence)
+        return torch.tanh(graph_message + local_message)
+
+
+class AttributeFeatureGraph(nn.Module):
+    """Visual attribute nodes with weighted source-to-target graph messages.
+
+    CSV conditional rows denote P(column | row), hence transpose for target
+    rows/source columns. Cross matrices are symmetric. Keep cv4 keys intact.
+    """
+
+    def __init__(
+        self,
+        channels,
+        na,
+        nal,
+        com_path,
+        operator="gca",
+        conditional=False,
+        dim=16,
+        gain=1.0,
+    ):
+        super().__init__()
+        self.na, self.nal, self.dim = na, nal, dim
+        self.operator = operator
+        self.enabled = True
+        try:
+            self.feature_gain = float(gain)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"feature_gain must be a finite non-negative number, got {gain!r}") from error
+        if not math.isfinite(self.feature_gain) or self.feature_gain < 0:
+            raise ValueError(f"feature_gain must be a finite non-negative number, got {gain!r}")
+        graph = _load_attribute_graph(com_path, na)
+        if not torch.isfinite(graph).all():
+            raise ValueError("Attribute matrix contains non-finite values")
+        self.register_buffer("adjacency", graph.T.contiguous() if conditional else graph)
+        self.project = nn.Conv2d(channels, na * dim, 1)
+        self.identity = nn.Parameter(torch.randn(na, dim) * 0.02)
+        self.norm = nn.LayerNorm(dim)
+        self.message = nn.Linear(dim, dim)
+        self.fusion = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Linear(dim, nal))
+        nn.init.zeros_(self.fusion[-1].weight)
+        nn.init.zeros_(self.fusion[-1].bias)
+        self.gamma = nn.Parameter(torch.full((na, 1), 0.1))
+        if operator == "gat":
+            self.query = nn.Linear(dim, dim, bias=False)
+            self.key = nn.Linear(dim, dim, bias=False)
+        if operator == "gin":
+            self.eps = nn.Parameter(torch.zeros(()))
+        if operator == "graphsage":
+            self.sage_fusion = nn.Linear(2 * dim, dim)
+
+    def forward(self, features, logits):
+        if not self.enabled:
+            return logits
+        b, _, h, w = features.shape
+        nodes = self.project(features).reshape(b, self.na, self.dim, h * w).permute(0, 3, 1, 2)
+        nodes = self.norm(nodes + self.identity)
+        # Positive-class probability, not confidence in either class.
+        probs = logits.reshape(b, self.na, self.nal, h * w).softmax(2)
+        positive = (1 - probs[:, :, 0]).permute(0, 2, 1).detach()
+        outputs = []
+        # Bound the temporary attention tensor on P3 feature maps.
+        for start in range(0, h * w, 256):
+            x = nodes[:, start:start + 256]
+            p = positive[:, start:start + 256]
+            a = self.adjacency.to(x.dtype)
+            weights = a[None, None] * p.unsqueeze(-2)
+            if self.operator == "local":
+                context = torch.zeros_like(x)
+            else:
+                if self.operator == "gat":
+                    scores = self.query(x) @ self.key(x).transpose(-1, -2) / self.dim ** 0.5
+                    scores = scores + weights.clamp_min(1e-8).log()
+                    scores = scores.masked_fill(a[None, None] <= 0, -1e4)
+                    weights = scores.softmax(-1) * (a[None, None] > 0)
+                if self.operator == "gcn":
+                    row = weights.sum(-1).clamp_min(1e-6).rsqrt()
+                    col = weights.sum(-2).clamp_min(1e-6).rsqrt()
+                    weights = row.unsqueeze(-1) * weights * col.unsqueeze(-2)
+                elif self.operator != "gin":
+                    weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-6)
+                context = weights @ self.message(x)
+                if self.operator == "gin":
+                    context = context + (1 + self.eps) * x
+                elif self.operator == "gcn":
+                    context = context + self.message(x)
+                elif self.operator == "graphsage":
+                    context = self.sage_fusion(torch.cat((x, context), -1))
+                context = F.gelu(context)
+            delta = self.fusion(torch.cat((x, context), -1)) * (self.feature_gain * self.gamma)
+            outputs.append(delta)
+        delta = torch.cat(outputs, 1).permute(0, 2, 3, 1).reshape(b, self.na * self.nal, h, w)
+        return logits + delta
+
+
+class TextureAttention(nn.Module):
+    """ """
+
+    def __init__(self, channels, reduction=4, kernel_size=7):
+        super().__init__()
+        self.channels = channels
+
+        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+        )
+
+        self.spatial_conv = nn.Conv2d(1, 1, kernel_size, padding=kernel_size // 2, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+
+        edge = self.dw_conv(x)  # B,C,H,W
+
+        y = self.avg_pool(edge).view(b, c)  # B,C
+        y = self.mlp(y).view(b, c, 1, 1)  # B,C,1,1
+        ca = self.sigmoid(y)  # B,C,1,1
+
+        edge_map = edge.abs().mean(1, keepdim=True)  # B,1,H,W
+        sa = self.sigmoid(self.spatial_conv(edge_map))  # B,1,H,W
+
+        out = x * (1 + ca) * (1 + sa)
+        return out
+
+
+class _CoOccurrencePriorBase(nn.Module):
+    """Shared fixed-prior utilities for non-GNN attribute-head experiments."""
+
+    expects_multiclass = True
+
+    def __init__(self, na, nal, com_path=None, conditional=False):
+        super().__init__()
+        self.na = int(na)
+        self.nal = int(nal)
+        if self.na < 1 or self.nal < 2:
+            raise ValueError("Co-occurrence prior heads require na >= 1 and nal >= 2")
+
+        graph = _load_attribute_graph(com_path, self.na)
+        if conditional:
+            # The stored conditional CSV uses P(source | target).  The head
+            # consumes target rows by source columns, hence the transpose.
+            graph = graph.T.contiguous()
+        if not torch.isfinite(graph).all():
+            raise ValueError("Co-occurrence matrix contains non-finite values")
+
+        row_sum = graph.sum(dim=-1, keepdim=True)
+        empty_rows = row_sum.squeeze(-1) <= 1e-6
+        graph = graph / row_sum.clamp_min(1e-6)
+        if empty_rows.any():
+            # An isolated target should fall back to its own prediction rather
+            # than producing an all-zero prior signal.
+            identity = torch.eye(self.na, dtype=graph.dtype)
+            graph[empty_rows] = identity[empty_rows]
+        self.register_buffer("prior", graph)
+
+    def _prior_signals(self, logits):
+        """Return positive probability, prior support, and binary uncertainty."""
+        batch, channels, height, width = logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+
+        probs = logits.reshape(batch, self.na, self.nal, height, width).softmax(dim=2)
+        positive = (1.0 - probs[:, :, 0]).detach()
+        prior = self.prior.to(device=logits.device, dtype=logits.dtype)
+        support = torch.einsum("ij,bjhw->bihw", prior, positive)
+        uncertainty = 4.0 * positive * (1.0 - positive)
+        return positive, support, uncertainty
+
+    def _binary_state(self, logits):
+        """Split binary attribute logits and compute detached prior signals."""
+        batch, channels, height, width = logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+        if self.nal != 2:
+            raise ValueError("Direct co-occurrence logit heads currently support nal == 2 only")
+
+        reshaped = logits.reshape(batch, self.na, self.nal, height, width)
+        center = reshaped.mean(dim=2)
+        margin = reshaped[:, :, 1] - reshaped[:, :, 0]
+        positive, support, uncertainty = self._prior_signals(logits)
+        return center, margin, positive, support, uncertainty
+
+    @staticmethod
+    def _probability_logit(probability, eps=1e-4):
+        """Convert probabilities to bounded log-odds for stable margin fusion."""
+        probability = probability.clamp(eps, 1.0 - eps)
+        return torch.logit(probability).clamp(-5.0, 5.0)
+
+    @staticmethod
+    def _restore_binary(center, margin):
+        """Restore two-class logits while preserving their per-attribute center."""
+        outputs = torch.stack((center - 0.5 * margin, center + 0.5 * margin), dim=2)
+        return outputs.flatten(1, 2)
+
+    @staticmethod
+    def _residual_scale(gamma):
+        """Keep a newly added head conservative while allowing it to grow."""
+        return 0.1 * torch.tanh(gamma)
+
+
+class CoOccurrencePriorBias(_CoOccurrencePriorBase):
+    """Uncertainty-gated prior bias on binary attribute margins.
+
+    This is the lowest-cost control: it tests whether the co-occurrence matrix
+    contains useful decision-level information before adding feature adapters.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorBias currently supports nal == 2 only")
+        self.alpha = nn.Parameter(torch.zeros(1, self.na, 1, 1))
+
+    def forward(self, inputs):
+        batch, channels, height, width = inputs.shape
+        positive, support, uncertainty = self._prior_signals(inputs)
+        logits = inputs.reshape(batch, self.na, self.nal, height, width)
+        center = logits.mean(dim=2, keepdim=True)
+        margin = logits[:, :, 1] - logits[:, :, 0]
+        correction = (
+            self._residual_scale(self.alpha)
+            * uncertainty
+            * (support - positive)
+        )
+        updated_margin = margin + correction
+        outputs = torch.stack(
+            (center[:, :, 0] - 0.5 * updated_margin, center[:, :, 0] + 0.5 * updated_margin), dim=2
+        )
+        return outputs.reshape(batch, channels, height, width)
+
+
+class CoOccurrencePriorLogitBlend(_CoOccurrencePriorBase):
+    """Uncertainty-gated interpolation between visual and prior log-odds."""
+
+    def __init__(self, *args, initial_mix=0.25, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorLogitBlend currently supports nal == 2 only")
+        if not 0.0 < initial_mix < 1.0:
+            raise ValueError("initial_mix must be in (0, 1)")
+        self.mix_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_mix / (1.0 - initial_mix)))
+        )
+
+    def forward(self, inputs):
+        center, margin, _, support, uncertainty = self._binary_state(inputs)
+        prior_margin = self._probability_logit(support)
+        mix = torch.sigmoid(self.mix_logit)
+        updated_margin = margin + mix * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorLogitBias(_CoOccurrencePriorBase):
+    """Add a bounded, uncertainty-gated prior log-odds bias to each margin."""
+
+    def __init__(self, *args, initial_gain=0.25, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorLogitBias currently supports nal == 2 only")
+        if not -0.5 < initial_gain < 0.5:
+            raise ValueError("initial_gain must be in (-0.5, 0.5)")
+        self.raw_gain = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.atanh(initial_gain / 0.5))
+        )
+
+    def forward(self, inputs):
+        center, margin, _, support, uncertainty = self._binary_state(inputs)
+        prior_margin = self._probability_logit(support)
+        gain = 0.5 * torch.tanh(self.raw_gain)
+        updated_margin = margin + gain * uncertainty * prior_margin
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorLogitMLP(_CoOccurrencePriorBase):
+    """Learn a bounded nonlinear margin correction from visual and prior signals."""
+
+    def __init__(self, *args, hidden_chs=None, initial_gain=0.1, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorLogitMLP currently supports nal == 2 only")
+        if not -0.25 < initial_gain < 0.25:
+            raise ValueError("initial_gain must be in (-0.25, 0.25)")
+        hidden_chs = int(hidden_chs or max(16, self.na * 2))
+        self.raw_gain = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.atanh(initial_gain / 0.25))
+        )
+        self.correction = nn.Sequential(
+            nn.Conv2d(4 * self.na, hidden_chs, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_chs, self.na, kernel_size=1),
+        )
+        # The direct prior term makes the module useful from the first epoch;
+        # the nonlinear residual is learned without changing the baseline
+        # until its final projection receives a gradient.
+        nn.init.zeros_(self.correction[-1].weight)
+        nn.init.zeros_(self.correction[-1].bias)
+
+    def forward(self, inputs):
+        center, margin, positive, support, uncertainty = self._binary_state(inputs)
+        prior_margin = self._probability_logit(support)
+        signals = torch.cat((margin, prior_margin, uncertainty, support - positive), dim=1)
+        learned = 0.5 * torch.tanh(self.correction(signals))
+        gain = 0.25 * torch.tanh(self.raw_gain)
+        updated_margin = margin + uncertainty * (gain * prior_margin + learned)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorCrossAttention(_CoOccurrencePriorBase):
+    """Dynamically reweight prior edges from source-attribute visual margins."""
+
+    def __init__(self, *args, initial_mix=0.25, initial_temperature=0.25, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorCrossAttention currently supports nal == 2 only")
+        if not 0.0 < initial_mix < 1.0:
+            raise ValueError("initial_mix must be in (0, 1)")
+        self.mix_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_mix / (1.0 - initial_mix)))
+        )
+        self.temperature = nn.Parameter(torch.full((1, self.na, 1, 1), initial_temperature))
+
+    def forward(self, inputs):
+        center, margin, positive, _, uncertainty = self._binary_state(inputs)
+        prior = self.prior.to(device=inputs.device, dtype=inputs.dtype).clamp_min(1e-6)
+        scores = prior.log().view(1, self.na, self.na, 1, 1)
+        scores = scores + self.temperature.unsqueeze(2) * margin.detach().unsqueeze(1)
+        attention = torch.softmax(scores, dim=2)
+        dynamic_support = (attention * positive.unsqueeze(1)).sum(dim=2)
+        prior_margin = self._probability_logit(dynamic_support)
+        mix = torch.sigmoid(self.mix_logit)
+        updated_margin = margin + mix * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorDynamicGate(_CoOccurrencePriorBase):
+    """Use a per-pixel gate to decide when prior logit blending is trustworthy."""
+
+    def __init__(self, *args, hidden_chs=None, initial_gate=0.25, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorDynamicGate currently supports nal == 2 only")
+        if not 0.0 < initial_gate < 1.0:
+            raise ValueError("initial_gate must be in (0, 1)")
+        hidden_chs = int(hidden_chs or max(16, self.na * 2))
+        self.gate = nn.Sequential(
+            nn.Conv2d(4 * self.na, hidden_chs, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_chs, self.na, kernel_size=1),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, math.log(initial_gate / (1.0 - initial_gate)))
+
+    def forward(self, inputs):
+        center, margin, positive, support, uncertainty = self._binary_state(inputs)
+        prior_margin = self._probability_logit(support)
+        signals = torch.cat((margin, prior_margin, uncertainty, support - positive), dim=1)
+        gate = torch.sigmoid(self.gate(signals))
+        updated_margin = margin + gate * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorLogitDiffusion(_CoOccurrencePriorBase):
+    """Diffuse signed attribute margins through the fixed prior graph."""
+
+    def __init__(self, *args, initial_gain=0.12, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorLogitDiffusion currently supports nal == 2 only")
+        if not -0.5 < initial_gain < 0.5:
+            raise ValueError("initial_gain must be in (-0.5, 0.5)")
+        self.raw_gain = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.atanh(initial_gain / 0.5))
+        )
+
+    def forward(self, inputs):
+        center, margin, _, _, uncertainty = self._binary_state(inputs)
+        prior = self.prior.to(device=inputs.device, dtype=inputs.dtype)
+        # Propagate signed visual evidence instead of probabilities.  Detaching
+        # the source nodes keeps the update a target-wise calibration residual.
+        neighbor_margin = torch.einsum("ij,bjhw->bihw", prior, margin.detach())
+        correction = torch.tanh(neighbor_margin - margin)
+        gain = 0.5 * torch.tanh(self.raw_gain)
+        updated_margin = margin + gain * uncertainty * correction
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorConfidenceBlend(_CoOccurrencePriorBase):
+    """Blend with a prior support weighted by source-attribute confidence."""
+
+    def __init__(self, *args, initial_mix=0.2, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorConfidenceBlend currently supports nal == 2 only")
+        if not 0.0 < initial_mix < 1.0:
+            raise ValueError("initial_mix must be in (0, 1)")
+        self.mix_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_mix / (1.0 - initial_mix)))
+        )
+
+    def forward(self, inputs):
+        center, margin, positive, _, uncertainty = self._binary_state(inputs)
+        prior = self.prior.to(device=inputs.device, dtype=inputs.dtype)
+        source_confidence = (2.0 * positive - 1.0).abs()
+        weighted_positive = positive * source_confidence
+        numerator = torch.einsum("ij,bjhw->bihw", prior, weighted_positive)
+        denominator = torch.einsum("ij,bjhw->bihw", prior, source_confidence)
+        support = numerator / denominator.clamp_min(1e-4)
+        support = torch.where(denominator > 1e-4, support, positive)
+        prior_margin = self._probability_logit(support)
+        mix = torch.sigmoid(self.mix_logit)
+        updated_margin = margin + mix * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorAgreementTemperature(_CoOccurrencePriorBase):
+    """Use prior agreement to sharpen or soften visual margins without flipping them."""
+
+    def __init__(self, *args, initial_gain=0.1, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorAgreementTemperature currently supports nal == 2 only")
+        if not -0.5 < initial_gain < 0.5:
+            raise ValueError("initial_gain must be in (-0.5, 0.5)")
+        self.raw_gain = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.atanh(initial_gain / 0.5))
+        )
+
+    def forward(self, inputs):
+        center, margin, positive, support, uncertainty = self._binary_state(inputs)
+        # Agreement is positive when visual and prior probabilities agree and
+        # negative when the prior should reduce overconfident visual margins.
+        agreement = 1.0 - 2.0 * (positive - support).abs()
+        gain = 0.5 * torch.tanh(self.raw_gain)
+        temperature = 1.0 + gain * uncertainty * agreement
+        return self._restore_binary(center, margin * temperature)
+
+
+class CoOccurrencePriorStochasticBlend(_CoOccurrencePriorBase):
+    """Logit blending with training-only prior-edge dropout regularization."""
+
+    def __init__(self, *args, initial_mix=0.2, edge_dropout=0.15, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorStochasticBlend currently supports nal == 2 only")
+        if not 0.0 < initial_mix < 1.0:
+            raise ValueError("initial_mix must be in (0, 1)")
+        if not 0.0 <= edge_dropout < 1.0:
+            raise ValueError("edge_dropout must be in [0, 1)")
+        self.edge_dropout = float(edge_dropout)
+        self.mix_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_mix / (1.0 - initial_mix)))
+        )
+
+    def _sample_prior(self, inputs):
+        prior = self.prior.to(device=inputs.device, dtype=inputs.dtype)
+        if not self.training or self.edge_dropout == 0.0:
+            return prior
+        keep = torch.rand_like(prior).ge(self.edge_dropout)
+        # Preserve self-support and fall back to the original row if every
+        # non-diagonal edge in a row was dropped.
+        keep.fill_diagonal_(True)
+        sampled = prior * keep
+        row_sum = sampled.sum(dim=-1, keepdim=True)
+        return torch.where(row_sum > 1e-6, sampled / row_sum.clamp_min(1e-6), prior)
+
+    def forward(self, inputs):
+        center, margin, positive, _, uncertainty = self._binary_state(inputs)
+        prior = self._sample_prior(inputs)
+        support = torch.einsum("ij,bjhw->bihw", prior, positive)
+        prior_margin = self._probability_logit(support)
+        mix = torch.sigmoid(self.mix_logit)
+        updated_margin = margin + mix * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrencePriorLowRankAttention(_CoOccurrencePriorBase):
+    """Adapt fixed prior edges with a small low-rank target/source attention."""
+
+    def __init__(self, *args, rank=4, initial_mix=0.15, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("CoOccurrencePriorLowRankAttention currently supports nal == 2 only")
+        if not 0.0 < initial_mix < 1.0:
+            raise ValueError("initial_mix must be in (0, 1)")
+        self.rank = min(max(1, int(rank)), self.na)
+        self.query = nn.Parameter(torch.empty(self.na, self.rank))
+        self.key = nn.Parameter(torch.empty(self.na, self.rank))
+        nn.init.normal_(self.query, std=0.02)
+        nn.init.normal_(self.key, std=0.02)
+        self.mix_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_mix / (1.0 - initial_mix)))
+        )
+
+    def forward(self, inputs):
+        center, margin, positive, _, uncertainty = self._binary_state(inputs)
+        prior = self.prior.to(device=inputs.device, dtype=inputs.dtype)
+        edge_scores = prior.clamp_min(1e-6).log()
+        low_rank_scores = self.query.to(inputs.dtype) @ self.key.to(inputs.dtype).transpose(0, 1)
+        edge_scores = edge_scores + low_rank_scores / math.sqrt(self.rank)
+        edge_scores = edge_scores.masked_fill(prior <= 0, -1e4)
+        attention = torch.softmax(edge_scores, dim=-1)
+        support = torch.einsum("ij,bjhw->bihw", attention, positive)
+        prior_margin = self._probability_logit(support)
+        mix = torch.sigmoid(self.mix_logit)
+        updated_margin = margin + mix * uncertainty * (prior_margin - margin)
+        return self._restore_binary(center, updated_margin)
+
+
+class _CoOccurrencePriorFeatureHead(_CoOccurrencePriorBase):
+    """Base for feature-level prior attention modules in the attribute head."""
+
+    expects_features = True
+
+    def __init__(self, channels, *args, hidden_chs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.channels = int(channels)
+        self.hidden_chs = int(hidden_chs or max(32, min(128, self.channels // 4)))
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, features, logits, output_layer):
+        _, support, uncertainty = self._prior_signals(logits)
+        refined = self._refine(features, support, uncertainty)
+        return output_layer(refined)
+
+    def _refine(self, features, support, uncertainty):
+        raise NotImplementedError
+
+
+class _CoOccurrenceLabelGraphHead(_CoOccurrencePriorFeatureHead):
+    """Build label-aware spatial classifiers from a fixed co-occurrence graph."""
+
+    def __init__(self, channels, *args, label_dim=None, initial_gain=0.08, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("Label-graph prior heads currently support nal == 2 only")
+        self.label_dim = int(label_dim or max(16, min(64, self.channels // 4)))
+        if self.label_dim < 1:
+            raise ValueError("label_dim must be positive")
+        if not -0.5 < initial_gain < 0.5:
+            raise ValueError("initial_gain must be in (-0.5, 0.5)")
+        self.label_embedding = nn.Parameter(torch.randn(self.na, self.label_dim) * 0.02)
+        self.feature_projector = nn.Conv2d(self.channels, self.label_dim, kernel_size=1, bias=False)
+        self.node_norm = nn.LayerNorm(self.label_dim)
+        self.raw_gain = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.atanh(initial_gain / 0.5))
+        )
+
+    def _adjacency(self, features=None):
+        """Return the row-normalized fixed graph used by the label nodes."""
+        return self.prior.to(
+            device=self.label_embedding.device,
+            dtype=self.label_embedding.dtype,
+        )
+
+    def _propagate_nodes(self, features, logits):
+        raise NotImplementedError
+
+    def _graph_margin(self, features, node_features):
+        """Score each spatial feature against every graph-generated label node."""
+        projected = F.normalize(self.feature_projector(features), dim=1, eps=1e-6)
+        node_features = F.normalize(node_features.to(projected.dtype), dim=-1, eps=1e-6)
+        if node_features.ndim == 2:
+            return torch.einsum("bdhw,ad->bahw", projected, node_features)
+        return torch.einsum("bdhw,bad->bahw", projected, node_features)
+
+    def forward(self, features, logits, output_layer):
+        del output_layer  # The baseline logits are already computed by MDetect.
+        batch, channels, height, width = logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+        if self.nal != 2:
+            raise ValueError("Label-graph prior heads currently support nal == 2 only")
+
+        visual = logits.reshape(batch, self.na, self.nal, height, width)
+        center = visual.mean(dim=2)
+        margin = visual[:, :, 1] - visual[:, :, 0]
+        _, _, uncertainty = self._prior_signals(logits)
+        nodes = self._propagate_nodes(features, logits)
+        graph_margin = self._graph_margin(features, nodes)
+        gain = 0.5 * torch.tanh(self.raw_gain)
+        updated_margin = margin + gain * uncertainty * graph_margin
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrenceLabelGCN(_CoOccurrenceLabelGraphHead):
+    """Two-layer ML-GCN-style classifier generated from fixed label correlations."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.gcn1 = nn.Linear(self.label_dim, self.label_dim, bias=False)
+        self.gcn2 = nn.Linear(self.label_dim, self.label_dim, bias=False)
+
+    def _propagate_nodes(self, features, logits):
+        del features, logits
+        adjacency = self._adjacency()
+        nodes = torch.matmul(adjacency, self.label_embedding)
+        nodes = F.gelu(self.gcn1(nodes))
+        nodes = torch.matmul(adjacency, nodes)
+        return self.node_norm(self.gcn2(nodes))
+
+
+class CoOccurrenceLabelGCNThreshold(CoOccurrenceLabelGCN):
+    """ML-GCN with thresholded prior edges and an explicit self-loop fallback."""
+
+    def __init__(self, channels, *args, threshold=0.1, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if not 0.0 <= threshold < 1.0:
+            raise ValueError("threshold must be in [0, 1)")
+        self.threshold = float(threshold)
+
+    def _adjacency(self, features=None):
+        prior = super()._adjacency(features)
+        adjacency = prior * (prior >= self.threshold).to(prior.dtype)
+        identity = torch.eye(self.na, device=prior.device, dtype=prior.dtype)
+        adjacency = torch.maximum(adjacency, identity)
+        return adjacency / adjacency.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+class CoOccurrenceAdaptiveLabelGCN(CoOccurrenceLabelGCN):
+    """Fuse fixed co-occurrence edges with a low-rank learnable label graph."""
+
+    def __init__(self, channels, *args, rank=4, initial_prior_weight=0.75, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if not 0.0 < initial_prior_weight < 1.0:
+            raise ValueError("initial_prior_weight must be in (0, 1)")
+        self.rank = min(max(1, int(rank)), self.na)
+        self.edge_query = nn.Parameter(torch.empty(self.na, self.rank))
+        self.edge_key = nn.Parameter(torch.empty(self.na, self.rank))
+        nn.init.normal_(self.edge_query, std=0.02)
+        nn.init.normal_(self.edge_key, std=0.02)
+        self.prior_mix_logit = nn.Parameter(
+            torch.tensor(math.log(initial_prior_weight / (1.0 - initial_prior_weight)))
+        )
+
+    def _adjacency(self, features=None):
+        prior = super()._adjacency(features)
+        learned_scores = self.edge_query.to(prior.dtype) @ self.edge_key.to(prior.dtype).transpose(0, 1)
+        learned = torch.softmax(learned_scores / math.sqrt(self.rank), dim=-1)
+        prior_weight = torch.sigmoid(self.prior_mix_logit)
+        return prior_weight * prior + (1.0 - prior_weight) * learned
+
+
+class CoOccurrenceDynamicLabelGCN(CoOccurrenceLabelGCN):
+    """Use an image-conditioned label graph mixed with the global prior graph."""
+
+    def __init__(self, channels, *args, initial_prior_weight=0.75, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if not 0.0 < initial_prior_weight < 1.0:
+            raise ValueError("initial_prior_weight must be in (0, 1)")
+        self.image_condition = nn.Linear(self.channels, self.label_dim, bias=False)
+        self.node_query = nn.Linear(self.label_dim, self.label_dim, bias=False)
+        self.node_key = nn.Linear(self.label_dim, self.label_dim, bias=False)
+        self.prior_mix_logit = nn.Parameter(
+            torch.tensor(math.log(initial_prior_weight / (1.0 - initial_prior_weight)))
+        )
+
+    def _adjacency(self, features=None):
+        if features is None:
+            raise ValueError("Dynamic label graph requires spatial features")
+        batch = features.shape[0]
+        descriptor = F.adaptive_avg_pool2d(features, 1).flatten(1)
+        condition = self.image_condition(descriptor).unsqueeze(1)
+        base_nodes = self.label_embedding.unsqueeze(0).expand(batch, -1, -1)
+        queries = self.node_query(base_nodes + condition)
+        keys = self.node_key(base_nodes)
+        scores = torch.matmul(queries, keys.transpose(1, 2)) / math.sqrt(self.label_dim)
+        dynamic = torch.softmax(scores, dim=-1)
+        prior = super()._adjacency(features).unsqueeze(0)
+        prior = prior.to(device=dynamic.device, dtype=dynamic.dtype)
+        prior_weight = torch.sigmoid(self.prior_mix_logit).to(dynamic.dtype)
+        return prior_weight * prior + (1.0 - prior_weight) * dynamic
+
+    def _propagate_nodes(self, features, logits):
+        del logits
+        adjacency = self._adjacency(features)
+        nodes = self.label_embedding.unsqueeze(0).expand(features.shape[0], -1, -1).to(adjacency.dtype)
+        nodes = F.gelu(self.gcn1(torch.bmm(adjacency, nodes)))
+        nodes = self.gcn2(torch.bmm(adjacency, nodes))
+        return self.node_norm(nodes)
+
+
+class CoOccurrenceLabelAttention(_CoOccurrenceLabelGraphHead):
+    """Label-aware spatial attention followed by fixed prior message passing."""
+
+    def __init__(self, channels, *args, initial_attention=0.2, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if not 0.0 < initial_attention < 1.0:
+            raise ValueError("initial_attention must be in (0, 1)")
+        self.attention_logit = nn.Parameter(
+            torch.full((1, self.na, 1, 1), math.log(initial_attention / (1.0 - initial_attention)))
+        )
+
+    def _propagate_nodes(self, features, logits):
+        del features, logits
+        adjacency = self._adjacency()
+        return self.node_norm(torch.matmul(adjacency, self.label_embedding))
+
+    def _graph_margin(self, features, node_features):
+        local_margin = super()._graph_margin(features, node_features)
+        adjacency = self._adjacency().to(device=local_margin.device, dtype=local_margin.dtype)
+        local_probability = torch.sigmoid(local_margin)
+        prior_probability = torch.einsum("ij,bjhw->bihw", adjacency, local_probability)
+        prior_margin = 2.0 * prior_probability - 1.0
+        attention = torch.sigmoid(self.attention_logit)
+        return local_margin + attention * prior_margin
+
+
+def _mlgcn_normalize_adjacency(graph):
+    """Build the fixed symmetric-normalized adjacency used by ML-GCN."""
+    graph = graph.clamp_min(0)
+    identity = torch.eye(graph.shape[0], device=graph.device, dtype=graph.dtype)
+    graph = graph + identity
+    degree = graph.sum(dim=-1).clamp_min(1e-6)
+    inv_sqrt_degree = degree.rsqrt()
+    return inv_sqrt_degree.unsqueeze(1) * graph * inv_sqrt_degree.unsqueeze(0)
+
+
+class _CoOccurrenceMLGCNBase(_CoOccurrencePriorBase):
+    """ML-GCN-style label classifier for spatial attribute logits.
+
+    The original ML-GCN uses fixed word embeddings as label-node inputs and
+    uses a GCN to generate one classifier weight vector per label.  This
+    project has no external label vocabulary, so ``[I | P]`` is used as a
+    deterministic structural label input: the identity distinguishes labels
+    and the normalized co-occurrence row supplies their semantics.  The GCN
+    then generates attribute classifiers, which score each spatial feature by
+    a normalized dot product, matching the source method's classifier-weight
+    construction rather than adding a small logit residual.
+    """
+
+    expects_features = True
+
+    def __init__(
+        self,
+        channels,
+        *args,
+        hidden_chs=None,
+        initial_blend=0.35,
+        learnable_label_input=False,
+        direct=False,
+        dynamic_blend=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("ML-GCN prior heads currently support nal == 2 only")
+        self.channels = int(channels)
+        self.hidden_chs = int(hidden_chs or max(32, min(128, self.channels // 4)))
+        self.direct = bool(direct)
+        self.dynamic_blend = bool(dynamic_blend)
+
+        identity = torch.eye(self.na, dtype=self.prior.dtype, device=self.prior.device)
+        label_input = torch.cat((identity, self.prior), dim=1)
+        self.register_buffer("label_input", label_input)
+        self.register_buffer("adjacency", _mlgcn_normalize_adjacency(self.prior))
+        if learnable_label_input:
+            # Start from the deterministic structural input; the delta lets
+            # the experiment test whether the graph needs a learned label
+            # vocabulary in addition to the fixed co-occurrence semantics.
+            self.label_input_delta = nn.Parameter(torch.zeros_like(label_input))
+
+        self.gcn1 = nn.Linear(2 * self.na, self.hidden_chs, bias=False)
+        self.gcn2 = nn.Linear(self.hidden_chs, self.channels, bias=False)
+        self.activation = nn.LeakyReLU(0.2, inplace=True)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(4.0)))
+        self.graph_bias = nn.Parameter(torch.zeros(1, self.na, 1, 1))
+
+        if not self.direct and not self.dynamic_blend:
+            if not 0.0 < initial_blend < 1.0:
+                raise ValueError("initial_blend must be in (0, 1)")
+            self.blend_logit = nn.Parameter(
+                torch.full((1, self.na, 1, 1), math.log(initial_blend / (1.0 - initial_blend)))
+            )
+
+    def _label_graph_input(self):
+        label_input = self.label_input
+        if hasattr(self, "label_input_delta"):
+            label_input = label_input + self.label_input_delta
+        adjacency = self.adjacency.to(device=label_input.device, dtype=label_input.dtype)
+        return label_input, adjacency
+
+    def _label_classifiers(self):
+        label_input, adjacency = self._label_graph_input()
+
+        # This is GraphConvolution from the reference implementation:
+        # A @ (X @ W), followed by a second graph-convolution layer.
+        nodes = torch.matmul(adjacency, self.gcn1(label_input))
+        nodes = self.activation(nodes)
+        nodes = torch.matmul(adjacency, self.gcn2(nodes))
+        return nodes
+
+    def _graph_margin(self, features, classifiers):
+        feature_vectors = F.normalize(features.float(), dim=1, eps=1e-6)
+        classifier_vectors = F.normalize(classifiers.float(), dim=-1, eps=1e-6)
+        margin = torch.einsum("bchw,ac->bahw", feature_vectors, classifier_vectors)
+        scale = self.logit_scale.float().exp().clamp(1.0, 16.0)
+        return scale * margin + self.graph_bias.float()
+
+    def forward(self, features, logits, output_layer):
+        del output_layer  # The graph generates the attribute classifier weights.
+        batch, channels, height, width = logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+
+        visual = logits.reshape(batch, self.na, self.nal, height, width)
+        center = visual.mean(dim=2)
+        visual_margin = visual[:, :, 1] - visual[:, :, 0]
+        graph_margin = self._graph_margin(features, self._label_classifiers())
+
+        if self.direct:
+            updated_margin = graph_margin.to(dtype=visual_margin.dtype)
+        elif self.dynamic_blend:
+            raise NotImplementedError("Dynamic ML-GCN subclasses must implement forward")
+        else:
+            blend = torch.sigmoid(self.blend_logit).to(dtype=graph_margin.dtype)
+            updated_margin = (1.0 - blend) * visual_margin.float() + blend * graph_margin
+            updated_margin = updated_margin.to(dtype=visual_margin.dtype)
+        return self._restore_binary(center, updated_margin)
+
+
+class CoOccurrenceMLGCN(_CoOccurrenceMLGCNBase):
+    """Weighted symmetric-normalized ML-GCN with a visual anchor blend."""
+
+
+class CoOccurrenceMLGCNThreshold(_CoOccurrenceMLGCNBase):
+    """ML-GCN using thresholded co-occurrence edges plus self-loops."""
+
+    def __init__(self, channels, *args, threshold=0.1, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        if not 0.0 <= threshold < 1.0:
+            raise ValueError("threshold must be in [0, 1)")
+        self.threshold = float(threshold)
+        thresholded = self.prior * (self.prior >= self.threshold).to(self.prior.dtype)
+        with torch.no_grad():
+            self.adjacency.copy_(_mlgcn_normalize_adjacency(thresholded))
+
+
+class CoOccurrenceMLGCNDirect(_CoOccurrenceMLGCNBase):
+    """Source-faithful graph-generated classifier without visual blending."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, direct=True, **kwargs)
+
+
+class CoOccurrenceMLGCNLearnable(_CoOccurrenceMLGCNBase):
+    """Weighted ML-GCN with a learnable delta over the structural label input."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, learnable_label_input=True, **kwargs)
+
+
+class CoOccurrenceMLGAT(_CoOccurrenceMLGCNBase):
+    """ML-GCN label nodes refined by graph-masked attention before scoring."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.gat_query = nn.Linear(self.hidden_chs, self.hidden_chs, bias=False)
+        self.gat_key = nn.Linear(self.hidden_chs, self.hidden_chs, bias=False)
+        self.gat_value = nn.Linear(self.hidden_chs, self.hidden_chs, bias=False)
+        self.gat_out = nn.Linear(self.hidden_chs, self.hidden_chs, bias=False)
+
+    def _label_classifiers(self):
+        label_input, adjacency = self._label_graph_input()
+        nodes = self.activation(torch.matmul(adjacency, self.gcn1(label_input)))
+        queries = self.gat_query(nodes)
+        keys = self.gat_key(nodes)
+        values = self.gat_value(nodes)
+        scores = torch.matmul(queries, keys.transpose(0, 1)) / math.sqrt(self.hidden_chs)
+        connected = adjacency > 0
+        scores = scores.masked_fill(~connected, -1e4)
+        attention = torch.softmax(scores, dim=-1)
+        nodes = self.activation(nodes + self.gat_out(torch.matmul(attention, values)))
+        nodes = torch.matmul(adjacency, nodes)
+        return self.gcn2(nodes)
+
+
+class CoOccurrenceMLSAGE(_CoOccurrenceMLGCNBase):
+    """ML-GCN label nodes refined with two GraphSAGE-style aggregations."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.sage_fuse = nn.Linear(2 * self.hidden_chs, self.hidden_chs)
+
+    def _label_classifiers(self):
+        label_input, adjacency = self._label_graph_input()
+        nodes = self.activation(torch.matmul(adjacency, self.gcn1(label_input)))
+        for _ in range(2):
+            neighbors = torch.matmul(adjacency, nodes)
+            nodes = self.activation(self.sage_fuse(torch.cat((nodes, neighbors), dim=-1)))
+        return self.gcn2(nodes)
+
+
+class CoOccurrenceMLTransformer(_CoOccurrenceMLGCNBase):
+    """Graph-masked label Transformer used to generate spatial classifiers."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        attention_heads = min(4, self.hidden_chs)
+        while self.hidden_chs % attention_heads:
+            attention_heads -= 1
+        self.label_attention = nn.MultiheadAttention(
+            self.hidden_chs,
+            attention_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.label_norm1 = nn.LayerNorm(self.hidden_chs)
+        self.label_norm2 = nn.LayerNorm(self.hidden_chs)
+        self.label_ffn = nn.Sequential(
+            nn.Linear(self.hidden_chs, 2 * self.hidden_chs),
+            nn.GELU(),
+            nn.Linear(2 * self.hidden_chs, self.hidden_chs),
+        )
+
+    def _label_classifiers(self):
+        label_input, adjacency = self._label_graph_input()
+        nodes = self.activation(torch.matmul(adjacency, self.gcn1(label_input)))
+        attention_mask = torch.where(
+            adjacency > 0,
+            adjacency.clamp_min(1e-6).log(),
+            torch.full_like(adjacency, -1e4),
+        )
+        attended, _ = self.label_attention(
+            nodes.unsqueeze(0),
+            nodes.unsqueeze(0),
+            nodes.unsqueeze(0),
+            attn_mask=attention_mask,
+            need_weights=False,
+        )
+        nodes = self.label_norm1(nodes + attended.squeeze(0))
+        nodes = self.label_norm2(nodes + self.label_ffn(nodes))
+        nodes = torch.matmul(adjacency, nodes)
+        return self.gcn2(nodes)
+
+
+class CoOccurrenceMLGCNMoE(_CoOccurrenceMLGCNBase):
+    """Pixel-wise mixture of visual and ML-GCN-generated classifiers."""
+
+    def __init__(self, channels, *args, initial_gate=0.2, **kwargs):
+        super().__init__(channels, *args, dynamic_blend=True, **kwargs)
+        if not 0.0 < initial_gate < 1.0:
+            raise ValueError("initial_gate must be in (0, 1)")
+        self.graph_gate = nn.Sequential(
+            nn.Conv2d(self.channels + self.na, self.hidden_chs, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_chs, self.na, kernel_size=1),
+        )
+        nn.init.zeros_(self.graph_gate[-1].weight)
+        nn.init.constant_(self.graph_gate[-1].bias, math.log(initial_gate / (1.0 - initial_gate)))
+
+    def forward(self, features, logits, output_layer):
+        del output_layer
+        batch, channels, height, width = logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels, got {channels}")
+
+        visual = logits.reshape(batch, self.na, self.nal, height, width)
+        center = visual.mean(dim=2)
+        visual_margin = visual[:, :, 1] - visual[:, :, 0]
+        graph_margin = self._graph_margin(features, self._label_classifiers())
+        gate_input = torch.cat((features.float(), visual_margin.float()), dim=1)
+        gate_dtype = self.graph_gate[0].weight.dtype
+        gate = torch.sigmoid(self.graph_gate(gate_input.to(dtype=gate_dtype)))
+        updated_margin = (1.0 - gate) * visual_margin.float() + gate * graph_margin
+        return self._restore_binary(center, updated_margin.to(dtype=visual_margin.dtype))
+
+
+class CoOccurrenceGraphMeanField(_CoOccurrencePriorBase):
+    """Two-step graph mean-field refinement of visual attribute margins."""
+
+    expects_features = True
+
+    def __init__(self, channels, *args, rank=4, iterations=2, initial_gain=0.25, initial_gate=0.35, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.nal != 2:
+            raise ValueError("Graph mean-field prior heads currently support nal == 2 only")
+        if not 0.0 < initial_gain < 1.0:
+            raise ValueError("initial_gain must be in (0, 1)")
+        if not 0.0 < initial_gate < 1.0:
+            raise ValueError("initial_gate must be in (0, 1)")
+        self.channels = int(channels)
+        self.hidden_chs = int(max(32, min(128, self.channels // 4)))
+        self.rank = min(max(1, int(rank)), self.na)
+        self.iterations = max(1, int(iterations))
+
+        identity = torch.eye(self.na, dtype=self.prior.dtype, device=self.prior.device)
+        self.register_buffer("label_input", torch.cat((identity, self.prior), dim=1))
+        self.edge_query = nn.Linear(2 * self.na, self.rank, bias=False)
+        self.edge_key = nn.Linear(2 * self.na, self.rank, bias=False)
+        self.raw_gain = nn.Parameter(torch.tensor(math.log(initial_gain / (1.0 - initial_gain))))
+        self.raw_temperature = nn.Parameter(torch.zeros(self.na))
+        self.feature_gate = nn.Sequential(
+            nn.Conv2d(self.channels + 2 * self.na, self.hidden_chs, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_chs, self.na, kernel_size=1),
+        )
+        nn.init.zeros_(self.feature_gate[-1].weight)
+        nn.init.constant_(self.feature_gate[-1].bias, math.log(initial_gate / (1.0 - initial_gate)))
+
+    def _edge_attention(self):
+        label_input = self.label_input
+        prior = self.prior.to(device=label_input.device, dtype=label_input.dtype)
+        queries = self.edge_query(label_input)
+        keys = self.edge_key(label_input)
+        scores = torch.matmul(queries, keys.transpose(0, 1)) / math.sqrt(self.rank)
+        connected = prior > 0
+        scores = scores + prior.clamp_min(1e-6).log()
+        scores = scores.masked_fill(~connected, -1e4)
+        return torch.softmax(scores, dim=-1)
+
+    def forward(self, features, logits, output_layer):
+        del output_layer
+        center, margin, _, _, _ = self._binary_state(logits)
+        refined = margin.float()
+        adjacency = self._edge_attention()
+        gain = torch.sigmoid(self.raw_gain)
+        temperature = (0.5 + F.softplus(self.raw_temperature)).view(1, self.na, 1, 1)
+        for _ in range(self.iterations):
+            belief = torch.tanh(refined / temperature)
+            message = torch.einsum(
+                "ij,bjhw->bihw",
+                adjacency.to(device=refined.device, dtype=refined.dtype),
+                belief,
+            )
+            gate_input = torch.cat((features.float(), refined, message), dim=1)
+            # The detector may be converted to FP16 before validation.  The
+            # feature tensors above intentionally stay in FP32 for stable
+            # mean-field updates, so match the gate input to its convolution
+            # parameters before applying the feature gate.
+            gate_dtype = self.feature_gate[0].weight.dtype
+            gate = torch.sigmoid(self.feature_gate(gate_input.to(dtype=gate_dtype)))
+            refined = refined + gain * gate * message
+        return self._restore_binary(center, refined.to(dtype=margin.dtype))
+
+
+class CoOccurrencePriorChannelAttention(_CoOccurrencePriorFeatureHead):
+    """Channel attention conditioned on fixed co-occurrence support."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.channel_gate = nn.Sequential(
+            nn.Linear(self.channels + 2 * self.na, self.hidden_chs),
+            nn.GELU(),
+            nn.Linear(self.hidden_chs, self.channels),
+        )
+        nn.init.zeros_(self.channel_gate[-1].weight)
+        nn.init.zeros_(self.channel_gate[-1].bias)
+
+    def _refine(self, features, support, uncertainty):
+        descriptor = torch.cat(
+            (
+                F.adaptive_avg_pool2d(features, 1).flatten(1),
+                support.mean(dim=(2, 3)),
+                uncertainty.mean(dim=(2, 3)),
+            ),
+            dim=1,
+        )
+        gate = torch.sigmoid(self.channel_gate(descriptor)).unsqueeze(-1).unsqueeze(-1)
+        return features * (1.0 + self._residual_scale(self.gamma) * gate)
+
+
+class CoOccurrencePriorSpatialAttention(_CoOccurrencePriorFeatureHead):
+    """Spatial attention from visual energy and co-occurrence support maps."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.spatial_gate = nn.Conv2d(3, 1, kernel_size=7, padding=3, bias=True)
+        nn.init.zeros_(self.spatial_gate.weight)
+        nn.init.zeros_(self.spatial_gate.bias)
+
+    def _refine(self, features, support, uncertainty):
+        maps = torch.cat(
+            (
+                features.mean(dim=1, keepdim=True),
+                support.mean(dim=1, keepdim=True),
+                uncertainty.mean(dim=1, keepdim=True),
+            ),
+            dim=1,
+        )
+        gate = torch.sigmoid(self.spatial_gate(maps))
+        return features * (1.0 + self._residual_scale(self.gamma) * gate)
+
+
+class CoOccurrencePriorMixtureHead(_CoOccurrencePriorFeatureHead):
+    """Mix a local expert and a prior-conditioned expert with a learned gate."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        # The expert output layers start at zero so the initial prediction is
+        # exactly the baseline.  Keep a small non-zero outer gate so those
+        # zero-initialized experts still receive gradients on the first step.
+        nn.init.constant_(self.gamma, 0.1)
+        prior_channels = self.channels + 2 * self.na
+        self.local_expert = nn.Sequential(
+            nn.Conv2d(self.channels, self.channels, 1),
+            nn.GELU(),
+            nn.Conv2d(self.channels, self.channels, 1),
+        )
+        self.prior_expert = nn.Sequential(
+            nn.Conv2d(prior_channels, self.channels, 1),
+            nn.GELU(),
+            nn.Conv2d(self.channels, self.channels, 1),
+        )
+        self.expert_gate = nn.Sequential(
+            nn.Linear(prior_channels, self.hidden_chs),
+            nn.GELU(),
+            nn.Linear(self.hidden_chs, 1),
+        )
+        for expert in (self.local_expert, self.prior_expert):
+            nn.init.zeros_(expert[-1].weight)
+            nn.init.zeros_(expert[-1].bias)
+        nn.init.zeros_(self.expert_gate[-1].weight)
+        nn.init.zeros_(self.expert_gate[-1].bias)
+
+    def _refine(self, features, support, uncertainty):
+        prior_features = torch.cat((features, support, uncertainty), dim=1)
+        descriptor = F.adaptive_avg_pool2d(prior_features, 1).flatten(1)
+        gate = torch.sigmoid(self.expert_gate(descriptor)).unsqueeze(-1).unsqueeze(-1)
+        delta = (1.0 - gate) * self.local_expert(features) + gate * self.prior_expert(prior_features)
+        return features + self._residual_scale(self.gamma) * delta
+
+
+class CoOccurrenceTextureAttention(_CoOccurrencePriorFeatureHead):
+    """Texture attention whose spatial write is gated by prior support."""
+
+    def __init__(self, channels, *args, **kwargs):
+        super().__init__(channels, *args, **kwargs)
+        self.texture = TextureAttention(channels)
+        self.spatial_gate = nn.Conv2d(3, 1, kernel_size=7, padding=3, bias=True)
+        nn.init.zeros_(self.spatial_gate.weight)
+        nn.init.zeros_(self.spatial_gate.bias)
+
+    def _refine(self, features, support, uncertainty):
+        maps = torch.cat(
+            (
+                features.mean(dim=1, keepdim=True),
+                support.mean(dim=1, keepdim=True),
+                uncertainty.mean(dim=1, keepdim=True),
+            ),
+            dim=1,
+        )
+        prior_gate = torch.sigmoid(self.spatial_gate(maps))
+        texture_delta = self.texture(features) - features
+        return features + self._residual_scale(self.gamma) * prior_gate * texture_delta
+
+
+# endregion
+
+
+class Detect(nn.Module):
+    """YOLO Detect head for detection models."""
+
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    format = None  # export format
+    end2end = False  # end2end
+    max_det = 300  # max_det
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+    legacy = False  # backward compatibility for v3/v5/v8/v9 models
+
+    def __init__(self, nc=80, ch=(), reg_max=16, end2end=None):
+        """Initialize the YOLO detection layer with classes, channels, DFL bins, and optional end-to-end mode."""
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = reg_max  # DFL channels (YOLO26 uses 1 to disable DFL)
+        if end2end is not None:
+            self.end2end = end2end
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        if len(ch) == 4:
+            c2, c3 = max((16, ch[1] // 4, self.reg_max * 4)), max(ch[1], min(self.nc, 100))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = (
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.nc, 1),
+                )
+                for x in ch
+            )
+        )
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+        if self.end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:  # Training path
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def forward_end2end(self, x, seg=False):
+        """
+        Performs forward pass of the v10Detect module.
+
+        Args:
+            x (tensor): Input tensor.
+
+        Returns:
+            (dict, tensor): If not in training mode, returns a dictionary containing the outputs of both one2many and one2one detections.
+                           If in training mode, returns a dictionary containing the outputs of one2many and one2one detections separately.
+        """
+        x_detach = [xi.detach() for xi in x]
+        one2one = [
+            torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])), 1) for i in range(self.nl)
+        ]
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:  # Training path
+            return {"one2many": x, "one2one": one2one}
+
+        if not seg:
+            y = self._inference(one2one)
+            y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc)
+            return y if self.export else (y, {"one2many": x, "one2one": one2one})
+        else:
+            y = self._inference(x)
+            y_one2one = self._inference(one2one)
+            return y if self.export else {"one2many": [y, x], "one2one": [y_one2one, one2one]}
+
+    def _inference(self, x):
+        """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps."""
+        # Inference path
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.format != "imx" and (self.dynamic or self.shape != shape):
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
+            box = x_cat[:, : self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4 :]
+        else:
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+
+        if self.export and self.format in {"tflite", "edgetpu"}:
+            # Precompute normalization factor to increase numerical stability
+            # See https://github.com/ultralytics/ultralytics/issues/7371
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+        elif self.export and self.format == "imx":
+            dbox = self.decode_bboxes(
+                self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
+            )
+            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+        else:
+            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+
+        return torch.cat((dbox, cls.sigmoid()), 1)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        if self.end2end:
+            for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
+                a[-1].bias.data[:] = 1.0  # box
+                b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+    def decode_bboxes(self, bboxes, anchors, xywh=True):
+        """Decode bounding boxes."""
+        return dist2bbox(bboxes, anchors, xywh=xywh and (not self.end2end), dim=1)
+
+    @staticmethod
+    def postprocess(preds: torch.Tensor, max_det: int, nc: int = 80):
+        """
+        Post-processes YOLO model predictions.
+
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
+                format [x, y, w, h, class_probs].
+            max_det (int): Maximum detections per image.
+            nc (int, optional): Number of classes. Default: 80.
+
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
+                dimension format [x, y, w, h, max_class_prob, class_index].
+        """
+        batch_size, anchors, _ = preds.shape  # i.e. shape(16,8400,84)
+        boxes, scores = preds.split([4, nc], dim=-1)
+        index = scores.amax(dim=-1).topk(min(max_det, anchors))[1].unsqueeze(-1)
+        boxes = boxes.gather(dim=1, index=index.repeat(1, 1, 4))
+        scores = scores.gather(dim=1, index=index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(min(max_det, anchors))
+        i = torch.arange(batch_size)[..., None]  # batch indices
+        return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
+
+
+class MDetect(nn.Module):
+    """YOLOv8 Detect head for detection models."""
+
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    end2end = False  # end2end
+    max_det = 300  # max_det
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, na=14, nal=2, params=(), ch=(), reg_max=16, end2end=None):
+        """Initialize the multi-attribute detection layer with optional DFL and end-to-end settings."""
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.na = na  # number of attributes
+        self.nal = nal
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = reg_max  # DFL channels (YOLO26 uses 1 to disable DFL)
+        if end2end is not None:
+            self.end2end = end2end
+        # MSegment reuses MDetect but its ``cv4`` branch is replaced by mask coefficients.
+        # Keep its legacy ``na``-channel layout while making the mdet head explicit about
+        # producing ``nal`` logits for each of its ``na`` attributes.
+        legacy_attribute_layout = self.__class__.__name__ in {"MSegment", "v10MSegment"}
+        self.attribute_channels = self.na if legacy_attribute_layout else self.na * self.nal
+        # This is the single layout predicate shared by the mdet loss/metrics/results code.
+        # A one-level attribute is not a multinomial classification problem.
+        self.multiclass_attributes = self.attribute_channels == self.na * self.nal and self.nal > 1
+        self.attribute_head_channels = self.nal if self.multiclass_attributes else 1
+        self.no = nc + self.attribute_channels + self.reg_max * 4  # number of outputs per anchor
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+        params = [None if v == "None" else v for v in params]
+        feature_gain = 1.0
+        if len(params) == 3:
+            sep, c4, gat = params
+            com_path = None
+            retrain = False
+        elif len(params) == 4:
+            sep, c4, gat, retrain = params
+            com_path = None
+        elif len(params) == 5:
+            sep, c4, gat, retrain, com_path = params
+        elif len(params) == 6:
+            sep, c4, gat, retrain, com_path, feature_gain = params
+        else:
+            raise ValueError("the length (%d) of params is not correct!" % len(params))
+        self.sep = sep
+        self.gat = gat
+        if retrain:
+            self.end2end = False
+        self.com_path = com_path
+        if feature_gain is None:
+            feature_gain = 1.0
+        try:
+            self.feature_gain = float(feature_gain)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"feature_gain must be a finite non-negative number, got {feature_gain!r}") from error
+        if not math.isfinite(self.feature_gain) or self.feature_gain < 0:
+            raise ValueError(f"feature_gain must be a finite non-negative number, got {feature_gain!r}")
+        c4 = c3 if c4 is None else c4
+        if not self.sep:
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_channels, 1)) for x in ch
+            )
+            self.cv4_out = None
+        elif self.sep == "6no":
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(C2fCIB(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_channels, 1)) for x in ch
+            )
+            self.cv4_out = None
+        elif self.sep == "7no":
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(
+                    C2fCIB(x, x, 3), Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_channels, 1)
+                )
+                for x in ch
+            )
+            self.cv4_out = None
+        elif self.sep == "8no":
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(
+                    RepNCSPELAN4(x, c4, c4, int(c4 // 2)),
+                    Conv(c4, c4, 3),
+                    nn.Conv2d(c4, self.attribute_channels, 1),
+                )
+                for x in ch
+            )
+            self.cv4_out = None
+        elif self.sep == "9no":
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(
+                    RepNCSPELAN4(x, x, x, int(x // 2)),
+                    Conv(x, c4, 3),
+                    Conv(c4, c4, 3),
+                    nn.Conv2d(c4, self.attribute_channels, 1),
+                )
+                for x in ch
+            )
+            self.cv4_out = None
+        elif self.sep == 1:
+            self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4 * self.na, 3)) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(Conv(c4 * self.na, c4, 3), nn.Conv2d(c4, self.attribute_head_channels, 1)) for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 2:
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(Conv(x, c4 * self.na, 3), Conv(c4 * self.na, c4 * self.na, 3)) for x in ch
+            )
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(Conv(c4 * self.na, c4, 3), nn.Conv2d(c4, self.attribute_head_channels, 1)) for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 3:
+            self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, x, 3)) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_head_channels, 1))
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 4:
+            self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3)) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(Conv(c4, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_head_channels, 1))
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 5:
+            self.cv4 = nn.ModuleList(nn.Sequential(nn.Identity()) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_head_channels, 1))
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 6:
+            self.cv4 = nn.ModuleList(nn.Sequential(C2fCIB(x, c4, 3)) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(
+                        Conv(c4, c4 // self.na, 3),
+                        nn.Conv2d(c4 // self.na, self.attribute_head_channels, 1),
+                    )
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 7:
+            self.cv4 = nn.ModuleList(nn.Sequential(C2fCIB(x, x, 3)) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(
+                        Conv(x, c4 // self.na, 3),
+                        nn.Conv2d(c4 // self.na, self.attribute_head_channels, 1),
+                    )
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 8:
+            self.cv4 = nn.ModuleList(nn.Sequential(RepNCSPELAN4(x, c4, c4, int(c4 // 2))) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(
+                        Conv(c4, c4 // self.na, 3),
+                        nn.Conv2d(c4 // self.na, self.attribute_head_channels, 1),
+                    )
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        elif self.sep == 9:
+            self.cv4 = nn.ModuleList(nn.Sequential(RepNCSPELAN4(x, x, x, int(x // 2))) for x in ch)
+            self.cv4_out = nn.ModuleList(
+                nn.ModuleList(
+                    nn.Sequential(
+                        Conv(x, c4 // self.na, 3),
+                        nn.Conv2d(c4 // self.na, self.attribute_head_channels, 1),
+                    )
+                    for x in ch
+                )
+                for _ in range(self.na)
+            )
+        else:
+            self.cv4 = nn.ModuleList(
+                nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.attribute_channels, 1)) for x in ch
+            )
+            self.cv4_out = None
+
+        if self.gat == "mlp":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlp") for x in ch)
+        elif self.gat == "mlpr":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlpr") for x in ch)
+        elif self.gat == "cos":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "cos") for x in ch)
+        elif self.gat == "mlp_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlp", res=True) for x in ch)
+        elif self.gat == "mlpr_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlpr", res=True) for x in ch)
+        elif self.gat == "cos_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "cos", res=True) for x in ch)
+        elif self.gat == "mlpt":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlpt") for x in ch)
+        elif self.gat == "cost":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "cost") for x in ch)
+        elif self.gat == "mlpt_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "mlpt", res=True) for x in ch)
+        elif self.gat == "cost_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "cost", res=True) for x in ch)
+        elif self.gat == "com_gat":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", com_path=self.com_path, proj=True, add_softmax=False) for x in ch
+            )
+        elif self.gat == "com_gat_residual":
+            self.gat_head = nn.ModuleList(
+                GAT(
+                    self.na,
+                    self.na,
+                    "com",
+                    com_path=self.com_path,
+                    proj=True,
+                    res=True,
+                    gated_res=True,
+                    add_softmax=False,
+                )
+                for x in ch
+            )
+        elif self.gat == "com":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "com", com_path=self.com_path) for x in ch)
+        elif self.gat == "com_residual":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", com_path=self.com_path, res=True, gated_res=True) for x in ch
+            )
+        elif self.gat == "com_res":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "com", res=True, com_path=self.com_path) for x in ch)
+        elif self.gat == "com_nosf":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", add_softmax=False, com_path=self.com_path) for x in ch
+            )
+        elif self.gat == "com_res_nosf":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", res=True, add_softmax=False, com_path=self.com_path) for x in ch
+            )
+        elif self.gat == "com_pure":
+            self.gat_head = nn.ModuleList(GAT(self.na, self.na, "com", com_path=self.com_path, proj=False) for x in ch)
+        elif self.gat == "com_res_pure":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", res=True, com_path=self.com_path, proj=False) for x in ch
+            )
+        elif self.gat == "com_nosf_pure":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", add_softmax=False, com_path=self.com_path, proj=False) for x in ch
+            )
+        elif self.gat == "com_res_nosf_pure":
+            self.gat_head = nn.ModuleList(
+                GAT(self.na, self.na, "com", res=True, add_softmax=False, com_path=self.com_path, proj=False)
+                for x in ch
+            )
+        elif self.gat == "gcn":
+            self.gat_head = nn.ModuleList(
+                GraphGCN(self.na, self.na, com_path=self.com_path, res=True) for x in ch
+            )
+        elif self.gat == "gat_learned":
+            self.gat_head = nn.ModuleList(
+                GraphGAT(self.na, self.na, com_path=self.com_path, res=True) for x in ch
+            )
+        elif self.gat == "graphsage":
+            self.gat_head = nn.ModuleList(
+                GraphSAGE(self.na, self.na, com_path=self.com_path, res=True) for x in ch
+            )
+        elif self.gat == "gin":
+            self.gat_head = nn.ModuleList(
+                GraphGIN(self.na, self.na, com_path=self.com_path, res=True) for x in ch
+            )
+        elif self.gat in {
+            "fga_margin_residual",
+            "com_gat_margin_residual",
+            "gcn_margin_residual",
+            "gat_margin_residual",
+            "graphsage_margin_residual",
+            "gin_margin_residual",
+            "fga_mha_margin_residual",
+            "com_gat_mha_margin_residual",
+            "gcn_mha_margin_residual",
+            "gat_mha_margin_residual",
+            "graphsage_mha_margin_residual",
+            "gin_mha_margin_residual",
+        }:
+            # These variants consume all na*nal logits at once so they can
+            # propagate the two-class risk margin for every attribute.
+            margin_variants = {
+                "fga_margin_residual": "fga",
+                "com_gat_margin_residual": "fga",  # legacy token
+                "gcn_margin_residual": "gcn",
+                "gat_margin_residual": "gat",
+                "graphsage_margin_residual": "graphsage",
+                "gin_margin_residual": "gin",
+            }
+            mha_margin_variants = {
+                "fga_mha_margin_residual": "fga",
+                "com_gat_mha_margin_residual": "fga",  # legacy token
+                "gcn_mha_margin_residual": "gcn",
+                "gat_mha_margin_residual": "gat",
+                "graphsage_mha_margin_residual": "graphsage",
+                "gin_mha_margin_residual": "gin",
+            }
+            if self.gat in margin_variants:
+                gnn_type = margin_variants[self.gat]
+                margin_class = GCAMarginResidual
+            else:
+                gnn_type = mha_margin_variants[self.gat]
+                margin_class = GCAMultiHeadMarginResidual
+            self.gat_head = nn.ModuleList(
+                margin_class(self.na, self.nal, com_path=self.com_path, gate_init=0.1, gnn_type=gnn_type)
+                for x in ch
+            )
+        elif self.gat in {
+            "fga_feature_logit_mha_margin_residual",
+            "com_gat_feature_logit_mha_margin_residual",
+            "gcn_feature_logit_mha_margin_residual",
+            "gat_feature_logit_mha_margin_residual",
+            "graphsage_feature_logit_mha_margin_residual",
+            "gin_feature_logit_mha_margin_residual",
+        }:
+            # These variants receive both the visual attribute feature and the
+            # raw attribute logits.  The feature-logit cross-attention is
+            # applied before the selected margin-residual graph operator.
+            gnn_type = {
+                "fga_feature_logit_mha_margin_residual": "fga",
+                "com_gat_feature_logit_mha_margin_residual": "fga",  # legacy token
+                "gcn_feature_logit_mha_margin_residual": "gcn",
+                "gat_feature_logit_mha_margin_residual": "gat",
+                "graphsage_feature_logit_mha_margin_residual": "graphsage",
+                "gin_feature_logit_mha_margin_residual": "gin",
+            }[self.gat]
+            self.gat_head = nn.ModuleList(
+                GCAFeatureLogitMultiHeadResidual(
+                    c4,
+                    self.na,
+                    self.nal,
+                    com_path=self.com_path,
+                    gate_init=0.1,
+                    gnn_type=gnn_type,
+                )
+                for x in ch
+            )
+        elif isinstance(self.gat, str) and self.gat.startswith("com_prior_"):
+            # Fixed co-occurrence prior heads deliberately sit outside the GNN
+            # family.  They use the matrix as a support/calibration signal,
+            # while the visual features remain the source of the prediction.
+            prior_kind = self.gat[len("com_prior_") :]
+            conditional = prior_kind.endswith("_conditional")
+            if conditional:
+                prior_kind = prior_kind[: -len("_conditional")]
+            prior_classes = {
+                "bias": CoOccurrencePriorBias,
+                "channel": CoOccurrencePriorChannelAttention,
+                "channel_attention": CoOccurrencePriorChannelAttention,
+                "spatial": CoOccurrencePriorSpatialAttention,
+                "spatial_attention": CoOccurrencePriorSpatialAttention,
+                "moe": CoOccurrencePriorMixtureHead,
+                "texture": CoOccurrenceTextureAttention,
+                "logit_blend": CoOccurrencePriorLogitBlend,
+                "logit_bias": CoOccurrencePriorLogitBias,
+                "logit_mlp": CoOccurrencePriorLogitMLP,
+                "cross_attention": CoOccurrencePriorCrossAttention,
+                "dynamic_gate": CoOccurrencePriorDynamicGate,
+                "logit_diffusion": CoOccurrencePriorLogitDiffusion,
+                "confidence_blend": CoOccurrencePriorConfidenceBlend,
+                "agreement_temperature": CoOccurrencePriorAgreementTemperature,
+                "stochastic_blend": CoOccurrencePriorStochasticBlend,
+                "lowrank_attention": CoOccurrencePriorLowRankAttention,
+                "label_gcn": CoOccurrenceLabelGCN,
+                "label_gcn_threshold": CoOccurrenceLabelGCNThreshold,
+                "adaptive_label_gcn": CoOccurrenceAdaptiveLabelGCN,
+                "dynamic_label_gcn": CoOccurrenceDynamicLabelGCN,
+                "label_attention": CoOccurrenceLabelAttention,
+                "mlgcn": CoOccurrenceMLGCN,
+                "mlgcn_threshold": CoOccurrenceMLGCNThreshold,
+                "mlgcn_direct": CoOccurrenceMLGCNDirect,
+                "mlgcn_learnable": CoOccurrenceMLGCNLearnable,
+                "mlgat": CoOccurrenceMLGAT,
+                "mlsage": CoOccurrenceMLSAGE,
+                "mltransformer": CoOccurrenceMLTransformer,
+                "mlgcn_moe": CoOccurrenceMLGCNMoE,
+                "graph_mean_field": CoOccurrenceGraphMeanField,
+            }
+            prior_class = prior_classes.get(prior_kind)
+            if prior_class is None:
+                raise ValueError(f"Unknown co-occurrence prior head: {self.gat}")
+            direct_logit_kinds = {
+                "bias",
+                "logit_blend",
+                "logit_bias",
+                "logit_mlp",
+                "cross_attention",
+                "dynamic_gate",
+                "logit_diffusion",
+                "confidence_blend",
+                "agreement_temperature",
+                "stochastic_blend",
+                "lowrank_attention",
+            }
+            if prior_kind not in direct_logit_kinds and self.sep:
+                raise ValueError("Feature-level co-occurrence prior heads require the standard attribute head")
+            if prior_kind in direct_logit_kinds:
+                self.gat_head = nn.ModuleList(
+                    prior_class(self.na, self.nal, com_path=self.com_path, conditional=conditional) for _ in ch
+                )
+            else:
+                self.gat_head = nn.ModuleList(
+                    prior_class(
+                        c4,
+                        self.na,
+                        self.nal,
+                        com_path=self.com_path,
+                        conditional=conditional,
+                    )
+                    for _ in ch
+                )
+        elif isinstance(self.gat, str) and self.gat.startswith("feature_"):
+            if self.__class__.__name__ not in {"MDetect", "v10MDetect"} or self.sep:
+                raise ValueError("Feature graph requires the standard MDetect/v10MDetect attribute head")
+            operator = self.gat.split("_")[1]
+            if operator not in {"gca", "gcn", "gat", "graphsage", "gin", "local"}:
+                raise ValueError(f"Unknown feature graph operator: {operator}")
+            self.gat_head = nn.ModuleList(
+                AttributeFeatureGraph(c4, self.na, self.nal, self.com_path, operator,
+                                      conditional=self.gat.endswith("_conditional"),
+                                      gain=self.feature_gain) for _ in ch
+            )
+        elif isinstance(self.gat, str) and self.gat.startswith("com_") and self.gat.endswith("_residual"):
+            # The five structural GCA variants are crossed with the five graph
+            # operators by the experiment launcher.  Keeping this dispatch in
+            # one place ensures that every 5x5 combination uses the same
+            # multiclass-aware context/residual implementation and differs
+            # only where the selected variant explicitly requires it.
+            parts = self.gat.split("_")
+            gnn_type = parts[1] if len(parts) > 1 else None
+            variant = "_".join(parts[2:-1])
+            variant_class = {
+                "context": GCAContextResidual,
+                "adaptive": GCAAdaptiveResidual,
+                "twohop": GCATwoHopResidual,
+                "conv_adapter": GCAConvAdapterResidual,
+            }.get(variant)
+            gnn_type = _canonical_gnn_type(gnn_type)
+            if gnn_type not in GCAContextResidual.supported_gnn_types or variant_class is None:
+                self.gat_head = None
+            else:
+                self.gat_head = nn.ModuleList(
+                    variant_class(
+                        self.na,
+                        self.nal,
+                        com_path=self.com_path,
+                        gate_init=0.1,
+                        temperature=0.5,
+                        gnn_type=gnn_type,
+                    )
+                    for x in ch
+                )
+        else:
+            self.gat_head = None
+
+        if self.end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+            self.one2one_cv4_out = copy.deepcopy(self.cv4_out) if self.cv4_out is not None else None
+            self.one2one_gat_head = copy.deepcopy(self.gat_head) if self.gat_head is not None else None
+
+    def added_gat_head(self, com_path):
+        self.gat = "com_nosf_pure"
+        self.com_path = com_path
+        self.gat_head = nn.ModuleList(
+            GAT(self.na, self.na, "com", res=False, add_softmax=False, com_path=self.com_path, proj=False, leaky_rate=1)
+            for x in range(self.nl)
+        )
+
+    def _apply_attribute_head(self, features, logits, graph, output_layer=None):
+        """Apply a feature-aware or logits-only attribute refinement head."""
+        if isinstance(graph, AttributeFeatureGraph):
+            return graph(features, logits)
+        if getattr(graph, "expects_features", False):
+            return graph(features, logits, output_layer)
+        return self._apply_attribute_gat(logits, graph)
+
+    def _attribute_branch(self, x, classifier, graph):
+        if isinstance(graph, AttributeFeatureGraph) or getattr(graph, "expects_features", False):
+            features = classifier[1](classifier[0](x))
+            logits = classifier[2](features)
+            return self._apply_attribute_head(features, logits, graph, classifier[2])
+        return self._apply_attribute_gat(classifier(x), graph)
+
+    def _apply_attribute_gat(self, attribute_logits, gat_head):
+        """Apply an attribute-level GAT to each of the ``nal`` class-logit slices."""
+        if getattr(gat_head, "expects_multiclass", False):
+            return gat_head(attribute_logits)
+
+        if not self.multiclass_attributes:
+            return gat_head(attribute_logits)
+
+        batch, channels, height, width = attribute_logits.shape
+        expected_channels = self.na * self.nal
+        if channels != expected_channels:
+            raise RuntimeError(f"Expected {expected_channels} attribute channels before GAT, got {channels}")
+
+        # Existing GAT/co-occurrence matrices model relations between attributes (na x na).
+        # Apply the same graph independently to each level so those matrices remain valid.
+        attribute_logits = attribute_logits.reshape(batch, self.na, self.nal, height, width)
+        attribute_logits = attribute_logits.permute(0, 2, 1, 3, 4).reshape(batch * self.nal, self.na, height, width)
+        attribute_logits = gat_head(attribute_logits)
+        return (
+            attribute_logits.reshape(batch, self.nal, self.na, height, width)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch, expected_channels, height, width)
+        )
+
+    def use_one2many_head(self):
+        self.end2end = False
+        self.one2one_cv2 = None
+        self.one2one_cv3 = None
+        self.one2one_cv4 = None
+        self.one2one_cv4_out = None
+        self.one2one_gat_head = None
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        for i in range(self.nl):
+            if not self.sep or self.sep in ["6no", "7no", "8no", "9no"]:
+                if self.gat is not None:
+                    attribute_logits = self._attribute_branch(x[i], self.cv4[i], self.gat_head[i])
+                    x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), attribute_logits), 1)
+                else:
+                    x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), self.cv4[i](x[i])), 1)
+            else:
+                if self.sep in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
+                    if self.gat is not None:
+                        attribute_feature = self.cv4[i](x[i])
+                        attribute_logits = [self.cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        attribute_logits_cat = torch.cat(attribute_logits, 1)
+                        attribute_logits_gat = [
+                            self._apply_attribute_head(attribute_feature, attribute_logits_cat, self.gat_head[i])
+                        ]
+                        x[i] = torch.cat([self.cv2[i](x[i]), self.cv3[i](x[i])] + attribute_logits_gat, 1)
+                    else:
+                        attribute_feature = self.cv4[i](x[i])
+                        attribute_logits = [self.cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        x[i] = torch.cat([self.cv2[i](x[i]), self.cv3[i](x[i])] + attribute_logits, 1)
+                else:
+                    raise ValueError("sep error %g" % self.sep)
+        if self.training:  # Training path
+            return x
+        y = self._inference(x)
+        return y if self.export else (y, x)
+
+    def forward_end2end(self, x):
+        """
+        Performs forward pass of the v10Detect module.
+
+        Args:
+            x (tensor): Input tensor.
+
+        Returns:
+            (dict, tensor): If not in training mode, returns a dictionary containing the outputs of both one2many and one2one detections.
+                           If in training mode, returns a dictionary containing the outputs of one2many and one2one detections separately.
+        """
+        x_detach = [xi.detach() for xi in x]
+        for i in range(self.nl):
+            if not self.sep or self.sep in ["6no", "7no", "8no", "9no"]:
+                if self.gat is not None:
+                    attribute_logits = self._attribute_branch(
+                        x_detach[i], self.one2one_cv4[i], self.one2one_gat_head[i]
+                    )
+                    x_detach[i] = torch.cat(
+                        (self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i]), attribute_logits), 1
+                    )
+                else:
+                    x_detach[i] = torch.cat(
+                        (
+                            self.one2one_cv2[i](x_detach[i]),
+                            self.one2one_cv3[i](x_detach[i]),
+                            self.one2one_cv4[i](x_detach[i]),
+                        ),
+                        1,
+                    )
+            else:
+                if self.sep in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
+                    if self.gat is not None:
+                        attribute_feature = self.one2one_cv4[i](x_detach[i])
+                        attribute_logits = [self.one2one_cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        attribute_logits = [
+                            self._apply_attribute_head(
+                                attribute_feature,
+                                torch.cat(attribute_logits, 1),
+                                self.one2one_gat_head[i],
+                            )
+                        ]
+                        x_detach[i] = torch.cat(
+                            [self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])] + attribute_logits, 1
+                        )
+                    else:
+                        attribute_feature = self.one2one_cv4[i](x_detach[i])
+                        attribute_logits = [self.one2one_cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        x_detach[i] = torch.cat(
+                            [self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])] + attribute_logits, 1
+                        )
+                else:
+                    raise ValueError("sep error %g" % self.sep)
+        one2one = x_detach
+
+        for i in range(self.nl):
+            if not self.sep or self.sep in ["6no", "7no", "8no", "9no"]:
+                if self.gat is not None:
+                    attribute_logits = self._attribute_branch(x[i], self.cv4[i], self.gat_head[i])
+                    x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), attribute_logits), 1)
+                else:
+                    x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), self.cv4[i](x[i])), 1)
+            else:
+                if self.sep in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
+                    if self.gat is not None:
+                        attribute_feature = self.cv4[i](x[i])
+                        attribute_logits = [self.cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        attribute_logits = [
+                            self._apply_attribute_head(attribute_feature, torch.cat(attribute_logits, 1), self.gat_head[i])
+                        ]
+                        x[i] = torch.cat([self.cv2[i](x[i]), self.cv3[i](x[i])] + attribute_logits, 1)
+                    else:
+                        attribute_feature = self.cv4[i](x[i])
+                        attribute_logits = [self.cv4_out[j][i](attribute_feature) for j in range(self.na)]
+                        x[i] = torch.cat([self.cv2[i](x[i]), self.cv3[i](x[i])] + attribute_logits, 1)
+                else:
+                    raise ValueError("sep error %g" % self.sep)
+        if self.training:  # Training path
+            return {"one2many": x, "one2one": one2one}
+
+        y = self._inference(one2one)
+        y = self.postprocess(y.permute(0, 2, 1), self.max_det, self.nc, self.attribute_channels)
+        return y if self.export else (y, {"one2many": x, "one2one": one2one})
+
+    def _inference(self, x):
+        """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps."""
+        # Inference path
+        shape = x[0].shape  # BCHW
+        x_demo = x[0][0]
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        x_cat_demo = x_cat[0]
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
+            box = x_cat[:, : self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4 : self.reg_max * 4 + self.nc]
+            att = x_cat[:, self.reg_max * 4 + self.nc :]
+        else:
+            box, cls, att = x_cat.split((self.reg_max * 4, self.nc, self.attribute_channels), 1)
+
+        if self.export and self.format in {"tflite", "edgetpu"}:
+            # Precompute normalization factor to increase numerical stability
+            # See https://github.com/ultralytics/ultralytics/issues/7371
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+        else:
+            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+
+        if self.multiclass_attributes:
+            att = (
+                att.reshape(att.shape[0], self.na, self.nal, -1)
+                .softmax(dim=2)
+                .reshape(att.shape[0], self.attribute_channels, -1)
+            )
+
+        return torch.cat((dbox, cls.sigmoid(), att), 1)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        if self.end2end:
+            for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
+                a[-1].bias.data[:] = 1.0  # box
+                b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        if not self.sep:
+            for c, s in zip(m.cv4, m.stride):
+                c[-1].bias.data[: m.attribute_channels] = math.log(5 / m.na / (640 / s) ** 2)
+            if self.end2end:
+                for c, s in zip(m.one2one_cv4, m.stride):
+                    c[-1].bias.data[: m.attribute_channels] = math.log(5 / m.na / (640 / s) ** 2)
+        # elif self.sep in [1, 2, 3, 4, 5, 6]:
+        #     for c, s in zip(m.cv4_out, m.stride):
+        #         c[-1].bias.data[: m.na] = math.log(5 / m.na / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+        #     if self.end2end:
+        #         for c, s in zip(m.one2one_cv4_out, m.stride):
+        #             c[-1].bias.data[: m.na] = math.log(5 / m.na / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+    def decode_bboxes(self, bboxes, anchors):
+        """Decode bounding boxes."""
+        return dist2bbox(bboxes, anchors, xywh=not self.end2end, dim=1)
+
+    @staticmethod
+    def postprocess(preds: torch.Tensor, max_det: int, nc: int = 80, na: int = 10):
+        """
+        Post-processes the predictions obtained from a YOLOv10 model.
+
+        Args:
+            preds (torch.Tensor): The predictions obtained from the model. It should have a shape of (batch_size, num_boxes, 4 + num_classes).
+            max_det (int): The maximum number of detections to keep.
+            nc (int, optional): The number of classes. Defaults to 80.
+
+        Returns:
+            (torch.Tensor): The post-processed predictions with shape (batch_size, max_det, 6),
+                including bounding boxes, scores and cls.
+        """
+        assert 4 + nc + na == preds.shape[-1]
+        boxes, scores, attributes = preds.split([4, nc, na], dim=-1)
+        max_scores = scores.amax(dim=-1)
+        max_scores, index = torch.topk(max_scores, min(max_det, max_scores.shape[1]), axis=-1)
+        index = index.unsqueeze(-1)
+        boxes = torch.gather(boxes, dim=1, index=index.repeat(1, 1, boxes.shape[-1]))
+        scores = torch.gather(scores, dim=1, index=index.repeat(1, 1, scores.shape[-1]))
+        attributes = torch.gather(attributes, dim=1, index=index.repeat(1, 1, attributes.shape[-1]))
+
+        # NOTE: simplify but result slightly lower mAP
+        # scores, labels = scores.max(dim=-1)
+        # return torch.cat([boxes, scores.unsqueeze(-1), labels.unsqueeze(-1)], dim=-1)
+
+        scores, index = torch.topk(scores.flatten(1), max_det, axis=-1)
+        labels = index % nc
+        index = index // nc
+        boxes = boxes.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, boxes.shape[-1]))
+        attributes = attributes.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, attributes.shape[-1]))
+
+        return torch.cat([boxes, scores.unsqueeze(-1), labels.unsqueeze(-1).to(boxes.dtype), attributes], dim=-1)
+
+
+class Segment(Detect):
+    """YOLO Segment head for segmentation models."""
+
+    def __init__(self, nc=80, nm=32, npr=256, ch=()):
+        """Initialize the YOLO model attributes such as the number of masks, prototypes, and the convolution layers."""
+        super().__init__(nc, ch)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+
+    def forward(self, x):
+        """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+
+        mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, mc, p
+        return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class Segment(Detect):
+    """YOLO Segment head for segmentation models."""
+
+    def __init__(self, nc=80, nm=32, npr=256, ch=()):
+        """Initialize the YOLO model attributes such as the number of masks, prototypes, and the convolution layers."""
+        super().__init__(nc, ch)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+        if self.end2end:
+            self.one2one_proto = copy.deepcopy(self.proto)
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+
+    def forward_end2end(self, x):
+        x_detach = [xi.detach() for xi in x]
+        p_one2one = self.one2one_proto(x_detach[0])
+
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+
+        one2one_mc = torch.cat(
+            [self.one2one_cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+        )  # mask coefficients
+        mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+
+        out = Detect.forward_end2end(self, x, seg=True)
+
+        x, x_one2one = out["one2many"], out["one2one"]
+
+        if self.training:
+            return {"one2many": [x, mc, p], "one2one": [x_one2one, one2one_mc, p_one2one]}
+
+        one2many_output = (torch.cat([x[0], mc], 1), (x[1], mc, p))
+        one2one_output = (torch.cat([x_one2one[0], one2one_mc], 1), (x_one2one[1], one2one_mc, p_one2one))
+        return (torch.cat([x, mc], 1), p) if self.export else {"one2many": one2many_output, "one2one": one2one_output}
+
+    def forward(self, x):
+        """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+
+        mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, mc, p
+        return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class MSegment(MDetect):
+    """YOLOv8 Segment head for segmentation models."""
+
+    def __init__(self, nc=80, na=14, nal=2, nm=32, npr=256, params=(), ch=()):
+        """Initialize the YOLO model attributes such as the number of masks, prototypes, and the convolution layers."""
+        super().__init__(nc, na, nal, params, ch)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+
+        c4 = max(ch[0] // 4, self.nm)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+
+        if self.end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
+
+    def use_one2many_head(self):
+        self.super.use_one2many_head()
+        self.one2one_cv4 = None
+
+    def forward_end2end(self, x):
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+
+        mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        # TODO: change the bbox based attribute into mask based attribute
+        x = MDetect.forward(self, x)
+        if self.training:
+            return x, mc, p
+        return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+    def forward(self, x):
+        """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
+        if self.end2end:
+            return self.forward_end2end(x)
+
+        p = self.proto(x[0])  # mask protos
+        bs = p.shape[0]  # batch size
+
+        mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        # TODO: change the bbox based attribute into mask based attribute
+        x = MDetect.forward(self, x)
+        if self.training:
+            if self.use_contrast:
+                return x[0], mc, p, x[1]
+            else:
+                return x, mc, p
+        return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class OBB(Detect):
+    """YOLO OBB detection head for detection with rotation models."""
+
+    def __init__(self, nc=80, ne=1, ch=()):
+        """Initialize OBB with number of classes `nc` and layer channels `ch`."""
+        super().__init__(nc, ch)
+        self.ne = ne  # number of extra parameters
+
+        c4 = max(ch[0] // 4, self.ne)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        bs = x[0].shape[0]  # batch size
+        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
+        # NOTE: set `angle` as an attribute so that `decode_bboxes` could use it.
+        angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
+        # angle = angle.sigmoid() * math.pi / 2  # [0, pi/2]
+        if not self.training:
+            self.angle = angle
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, angle
+        return torch.cat([x, angle], 1) if self.export else (torch.cat([x[0], angle], 1), (x[1], angle))
+
+    def decode_bboxes(self, bboxes, anchors):
+        """Decode rotated bounding boxes."""
+        return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+
+class Pose(Detect):
+    """YOLO Pose head for keypoints models."""
+
+    def __init__(self, nc=80, kpt_shape=(17, 3), ch=()):
+        """Initialize YOLO network with default parameters and Convolutional Layers."""
+        super().__init__(nc, ch)
+        self.kpt_shape = kpt_shape  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+        self.nk = kpt_shape[0] * kpt_shape[1]  # number of keypoints total
+
+        c4 = max(ch[0] // 4, self.nk)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+
+    def forward(self, x):
+        """Perform forward pass through YOLO model and return predictions."""
+        bs = x[0].shape[0]  # batch size
+        kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, kpt
+        pred_kpt = self.kpts_decode(bs, kpt)
+        return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
+
+    def kpts_decode(self, bs, kpts):
+        """Decodes keypoints."""
+        ndim = self.kpt_shape[1]
+        if self.export:
+            if self.format in {
+                "tflite",
+                "edgetpu",
+            }:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
+                # Precompute normalization factor to increase numerical stability
+                y = kpts.view(bs, *self.kpt_shape, -1)
+                grid_h, grid_w = self.shape[2], self.shape[3]
+                grid_size = torch.tensor([grid_w, grid_h], device=y.device).reshape(1, 2, 1)
+                norm = self.strides / (self.stride[0] * grid_size)
+                a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * norm
+            else:
+                # NCNN fix
+                y = kpts.view(bs, *self.kpt_shape, -1)
+                a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if ndim == 3:
+                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            return a.view(bs, self.nk, -1)
+        else:
+            y = kpts.clone()
+            if ndim == 3:
+                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()  # sigmoid (WARNING: inplace .sigmoid_() Apple MPS bug)
+            y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+            y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+            return y
+
+
+class Classify(nn.Module):
+    """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""
+
+    export = False  # export mode
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
+        """Initializes YOLO classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape."""
+        super().__init__()
+        c_ = 1280  # efficientnet_b0 size
+        self.conv = Conv(c1, c_, k, s, p, g)
+        self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
+        self.drop = nn.Dropout(p=0.0, inplace=True)
+        self.linear = nn.Linear(c_, c2)  # to x(b,c2)
+
+    def forward(self, x):
+        """Performs a forward pass of the YOLO model on input image data."""
+        if isinstance(x, list):
+            x = torch.cat(x, 1)
+        x = self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+        if self.training:
+            return x
+        # Standard classification is mutually exclusive and uses softmax.
+        # Image-level multi-label classifiers opt in explicitly so existing
+        # classification checkpoints and all detection/segmentation heads are
+        # unchanged.
+        y = x.sigmoid() if getattr(self, "multilabel", False) else x.softmax(1)
+        return y if self.export else (y, x)
+
+
+class WorldDetect(Detect):
+    """Head for integrating YOLO detection models with semantic understanding from text embeddings."""
+
+    def __init__(self, nc=80, embed=512, with_bn=False, ch=()):
+        """Initialize YOLO detection layer with nc classes and layer channels ch."""
+        super().__init__(nc, ch)
+        c3 = max(ch[0], min(self.nc, 100))
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(BNContrastiveHead(embed) if with_bn else ContrastiveHead() for _ in ch)
+
+    def forward(self, x, text):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv4[i](self.cv3[i](x[i]), text)), 1)
+        if self.training:
+            return x
+
+        # Inference path
+        shape = x[0].shape  # BCHW
+        x_cat = torch.cat([xi.view(shape[0], self.nc + self.reg_max * 4, -1) for xi in x], 2)
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
+            box = x_cat[:, : self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4 :]
+        else:
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+
+        if self.export and self.format in {"tflite", "edgetpu"}:
+            # Precompute normalization factor to increase numerical stability
+            # See https://github.com/ultralytics/ultralytics/issues/7371
+            grid_h = shape[2]
+            grid_w = shape[3]
+            grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=box.device).reshape(1, 4, 1)
+            norm = self.strides / (self.stride[0] * grid_size)
+            dbox = self.decode_bboxes(self.dfl(box) * norm, self.anchors.unsqueeze(0) * norm[:, :2])
+        else:
+            dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
+
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+
+class RTDETRDecoder(nn.Module):
+    """
+    Real-Time Deformable Transformer Decoder (RTDETRDecoder) module for object detection.
+
+    This decoder module utilizes Transformer architecture along with deformable convolutions to predict bounding boxes
+    and class labels for objects in an image. It integrates features from multiple layers and runs through a series of
+    Transformer decoder layers to output the final predictions.
+    """
+
+    export = False  # export mode
+
+    def __init__(
+        self,
+        nc=80,
+        ch=(512, 1024, 2048),
+        na=0,  # number of attributes
+        nal=1,  # number of levels per attribute
+        hd=256,  # hidden dim
+        nq=300,  # num queries
+        ndp=4,  # num decoder points
+        nh=8,  # num head
+        ndl=6,  # num decoder layers
+        d_ffn=1024,  # dim of feedforward
+        dropout=0.0,
+        act=nn.ReLU(),
+        eval_idx=-1,
+        # Training args
+        nd=100,  # num denoising
+        label_noise_ratio=0.5,
+        box_noise_scale=1.0,
+        learnt_init_query=False,
+    ):
+        """
+        Initializes the RTDETRDecoder module with the given parameters.
+
+        Args:
+            nc (int): Number of classes. Default is 80.
+            ch (tuple): Channels in the backbone feature maps. Default is (512, 1024, 2048).
+            na (int): Number of object-level attributes. Default is 0 (vanilla RT-DETR).
+            nal (int): Number of levels for each attribute. Default is 1.
+            hd (int): Dimension of hidden layers. Default is 256.
+            nq (int): Number of query points. Default is 300.
+            ndp (int): Number of decoder points. Default is 4.
+            nh (int): Number of heads in multi-head attention. Default is 8.
+            ndl (int): Number of decoder layers. Default is 6.
+            d_ffn (int): Dimension of the feed-forward networks. Default is 1024.
+            dropout (float): Dropout rate. Default is 0.0.
+            act (nn.Module): Activation function. Default is nn.ReLU.
+            eval_idx (int): Evaluation index. Default is -1.
+            nd (int): Number of denoising. Default is 100.
+            label_noise_ratio (float): Label noise ratio. Default is 0.5.
+            box_noise_scale (float): Box noise scale. Default is 1.0.
+            learnt_init_query (bool): Whether to learn initial query embeddings. Default is False.
+        """
+        super().__init__()
+        self.hidden_dim = hd
+        self.nhead = nh
+        self.nl = len(ch)  # num level
+        self.nc = nc
+        self.na = int(na or 0)
+        self.nal = int(nal or 1)
+        self.attribute_channels = self.na * self.nal
+        self.multiclass_attributes = self.na > 0 and self.nal > 1
+        self.num_queries = nq
+        self.num_decoder_layers = ndl
+
+        # Backbone feature projection
+        self.input_proj = nn.ModuleList(nn.Sequential(nn.Conv2d(x, hd, 1, bias=False), nn.BatchNorm2d(hd)) for x in ch)
+        # NOTE: simplified version but it's not consistent with .pt weights.
+        # self.input_proj = nn.ModuleList(Conv(x, hd, act=False) for x in ch)
+
+        # Transformer module
+        decoder_layer = DeformableTransformerDecoderLayer(hd, nh, d_ffn, dropout, act, self.nl, ndp)
+        self.decoder = DeformableTransformerDecoder(hd, decoder_layer, ndl, eval_idx)
+
+        # Denoising part
+        self.denoising_class_embed = nn.Embedding(nc, hd)
+        self.num_denoising = nd
+        self.label_noise_ratio = label_noise_ratio
+        self.box_noise_scale = box_noise_scale
+
+        # Decoder embedding
+        self.learnt_init_query = learnt_init_query
+        if learnt_init_query:
+            self.tgt_embed = nn.Embedding(nq, hd)
+        self.query_pos_head = MLP(4, 2 * hd, hd, num_layers=2)
+
+        # Encoder head
+        self.enc_output = nn.Sequential(nn.Linear(hd, hd), nn.LayerNorm(hd))
+        self.enc_score_head = nn.Linear(hd, nc)
+        self.enc_bbox_head = MLP(hd, hd, 4, num_layers=3)
+        self.enc_attribute_head = nn.Linear(hd, self.attribute_channels) if self.attribute_channels else None
+
+        # Decoder head
+        self.dec_score_head = nn.ModuleList([nn.Linear(hd, nc) for _ in range(ndl)])
+        self.dec_bbox_head = nn.ModuleList([MLP(hd, hd, 4, num_layers=3) for _ in range(ndl)])
+        self.dec_attribute_head = (
+            nn.ModuleList([nn.Linear(hd, self.attribute_channels) for _ in range(ndl)])
+            if self.attribute_channels
+            else None
+        )
+
+        self._reset_parameters()
+
+    def forward(self, x, batch=None):
+        """Runs the forward pass of the module, returning bounding box and classification scores for the input."""
+        from ultralytics.models.utils.ops import get_cdn_group
+
+        # Input projection and embedding
+        feats, shapes = self._get_encoder_input(x)
+
+        # Prepare denoising training
+        dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
+            batch,
+            self.nc,
+            self.num_queries,
+            self.denoising_class_embed.weight,
+            self.num_denoising,
+            self.label_noise_ratio,
+            self.box_noise_scale,
+            self.training,
+        )
+
+        decoder_inputs = self._get_decoder_input(
+            feats, shapes, dn_embed, dn_bbox, return_attributes=bool(self.attribute_channels)
+        )
+        if self.attribute_channels:
+            embed, refer_bbox, enc_bboxes, enc_scores, enc_attributes = decoder_inputs
+        else:
+            embed, refer_bbox, enc_bboxes, enc_scores = decoder_inputs
+
+        # Decoder
+        decoder_outputs = self.decoder(
+            embed,
+            refer_bbox,
+            feats,
+            shapes,
+            self.dec_bbox_head,
+            self.dec_score_head,
+            self.query_pos_head,
+            attribute_head=self.dec_attribute_head,
+            attn_mask=attn_mask,
+        )
+        if self.attribute_channels:
+            dec_bboxes, dec_scores, dec_attributes = decoder_outputs
+            x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta, dec_attributes, enc_attributes
+        else:
+            dec_bboxes, dec_scores = decoder_outputs
+            x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
+        if self.training:
+            return x
+        # (bs, num_queries, 4 + nc + attribute_channels)
+        outputs = [dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()]
+        if self.attribute_channels:
+            attributes = dec_attributes.squeeze(0)
+            if self.multiclass_attributes:
+                attributes = attributes.reshape(attributes.shape[0], attributes.shape[1], self.na, self.nal)
+                attributes = attributes.softmax(-1).reshape(attributes.shape[0], attributes.shape[1], -1)
+            else:
+                attributes = attributes.sigmoid()
+            outputs.append(attributes)
+        y = torch.cat(outputs, -1)
+        return y if self.export else (y, x)
+
+    def _generate_anchors(self, shapes, grid_size=0.05, dtype=torch.float32, device="cpu", eps=1e-2):
+        """Generates anchor bounding boxes for given shapes with specific grid size and validates them."""
+        anchors = []
+        for i, (h, w) in enumerate(shapes):
+            sy = torch.arange(end=h, dtype=dtype, device=device)
+            sx = torch.arange(end=w, dtype=dtype, device=device)
+            grid_y, grid_x = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_10 else torch.meshgrid(sy, sx)
+            grid_xy = torch.stack([grid_x, grid_y], -1)  # (h, w, 2)
+
+            valid_WH = torch.tensor([w, h], dtype=dtype, device=device)
+            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH  # (1, h, w, 2)
+            wh = torch.ones_like(grid_xy, dtype=dtype, device=device) * grid_size * (2.0**i)
+            anchors.append(torch.cat([grid_xy, wh], -1).view(-1, h * w, 4))  # (1, h*w, 4)
+
+        anchors = torch.cat(anchors, 1)  # (1, h*w*nl, 4)
+        valid_mask = ((anchors > eps) & (anchors < 1 - eps)).all(-1, keepdim=True)  # 1, h*w*nl, 1
+        anchors = torch.log(anchors / (1 - anchors))
+        anchors = anchors.masked_fill(~valid_mask, float("inf"))
+        return anchors, valid_mask
+
+    def _get_encoder_input(self, x):
+        """Processes and returns encoder inputs by getting projection features from input and concatenating them."""
+        # Get projection features
+        x = [self.input_proj[i](feat) for i, feat in enumerate(x)]
+        # Get encoder inputs
+        feats = []
+        shapes = []
+        for feat in x:
+            h, w = feat.shape[2:]
+            # [b, c, h, w] -> [b, h*w, c]
+            feats.append(feat.flatten(2).permute(0, 2, 1))
+            # [nl, 2]
+            shapes.append([h, w])
+
+        # [b, h*w, c]
+        feats = torch.cat(feats, 1)
+        return feats, shapes
+
+    def _get_decoder_input(self, feats, shapes, dn_embed=None, dn_bbox=None, return_attributes=False):
+        """Generates and prepares the input required for the decoder from the provided features and shapes."""
+        bs = feats.shape[0]
+        # Prepare input for decoder
+        anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+        features = self.enc_output(valid_mask * feats)  # bs, h*w, 256
+
+        enc_outputs_scores = self.enc_score_head(features)  # (bs, h*w, nc)
+
+        # Query selection
+        # (bs, num_queries)
+        topk_ind = torch.topk(enc_outputs_scores.max(-1).values, self.num_queries, dim=1).indices.view(-1)
+        # (bs, num_queries)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+
+        # (bs, num_queries, 256)
+        top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        enc_attributes = self.enc_attribute_head(top_k_features) if return_attributes else None
+        # (bs, num_queries, 4)
+        top_k_anchors = anchors[:, topk_ind].view(bs, self.num_queries, -1)
+
+        # Dynamic anchors + static content
+        refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
+
+        enc_bboxes = refer_bbox.sigmoid()
+        if dn_bbox is not None:
+            refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
+        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+
+        embeddings = self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1) if self.learnt_init_query else top_k_features
+        if self.training:
+            refer_bbox = refer_bbox.detach()
+            if not self.learnt_init_query:
+                embeddings = embeddings.detach()
+        if dn_embed is not None:
+            embeddings = torch.cat([dn_embed, embeddings], 1)
+
+        outputs = (embeddings, refer_bbox, enc_bboxes, enc_scores)
+        return (*outputs, enc_attributes) if return_attributes else outputs
+
+    def _reset_parameters(self):
+        """Initializes or resets the parameters of the model's various components with predefined weights and biases."""
+        # Class and bbox head init
+        bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+        # NOTE: the weight initialization in `linear_init` would cause NaN when training with custom datasets.
+        # linear_init(self.enc_score_head)
+        constant_(self.enc_score_head.bias, bias_cls)
+        constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
+        constant_(self.enc_bbox_head.layers[-1].bias, 0.0)
+        for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
+            # linear_init(cls_)
+            constant_(cls_.bias, bias_cls)
+            constant_(reg_.layers[-1].weight, 0.0)
+            constant_(reg_.layers[-1].bias, 0.0)
+        if self.attribute_channels:
+            attribute_heads = [self.enc_attribute_head, *self.dec_attribute_head]
+            for attribute_head in attribute_heads:
+                xavier_uniform_(attribute_head.weight)
+                constant_(attribute_head.bias, 0.0)
+
+        linear_init(self.enc_output[0])
+        xavier_uniform_(self.enc_output[0].weight)
+        if self.learnt_init_query:
+            xavier_uniform_(self.tgt_embed.weight)
+        xavier_uniform_(self.query_pos_head.layers[0].weight)
+        xavier_uniform_(self.query_pos_head.layers[1].weight)
+        for layer in self.input_proj:
+            xavier_uniform_(layer[0].weight)
+
+
+class v10Detect(Detect):
+    """
+    v10 Detection head from https://arxiv.org/pdf/2405.14458.
+
+    Args:
+        nc (int): Number of classes.
+        ch (tuple): Tuple of channel sizes.
+
+    Attributes:
+        max_det (int): Maximum number of detections.
+
+    Methods:
+        __init__(self, nc=80, ch=()): Initializes the v10Detect object.
+        forward(self, x): Performs forward pass of the v10Detect module.
+        bias_init(self): Initializes biases of the Detect module.
+
+    """
+
+    end2end = True
+
+    def __init__(self, nc=80, ch=()):
+        """Initializes the v10Detect object with the specified number of classes and input channels."""
+        super().__init__(nc, ch)
+        c3 = max(ch[0], min(self.nc, 100))  # channels
+        # Light cls head
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)),
+                nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)),
+                nn.Conv2d(c3, self.nc, 1),
+            )
+            for x in ch
+        )
+        self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class v10MDetect(MDetect):
+    """
+    v10 Detection head from https://arxiv.org/pdf/2405.14458
+
+    Args:
+        nc (int): Number of classes.
+        ch (tuple): Tuple of channel sizes.
+
+    Attributes:
+        max_det (int): Maximum number of detections.
+
+    Methods:
+        __init__(self, nc=80, ch=()): Initializes the v10Detect object.
+        forward(self, x): Performs forward pass of the v10Detect module.
+        bias_init(self): Initializes biases of the Detect module.
+
+    """
+
+    end2end = True
+
+    def __init__(self, nc=80, na=14, nal=2, params=(), ch=()):
+        """Initializes the v10Detect object with the specified number of classes and input channels."""
+        super().__init__(nc, na, nal, params, ch)
+        c3 = max(ch[0], min(self.nc, 100))  # channels
+        # Light cls head
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(
+                nn.Sequential(Conv(x, x, 3, g=x), Conv(x, c3, 1)),
+                nn.Sequential(Conv(c3, c3, 3, g=c3), Conv(c3, c3, 1)),
+                nn.Conv2d(c3, self.nc, 1),
+            )
+            for x in ch
+        )
+        self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class v10Segment(Segment):
+    end2end = True
+
+    def __init__(self, nc=80, nm=32, npr=256, ch=()):
+        """Initializes the v10Detect object with the specified number of classes and input channels."""
+        super().__init__(nc, nm, npr, ch)
+
+
+class v10MSegment(MSegment):
+    end2end = True
+
+    def __init__(self, nc=80, na=14, nal=2, nm=32, npr=256, params=(), ch=()):
+        """Initializes the v10Detect object with the specified number of classes and input channels."""
+        super().__init__(nc=80, na=14, nal=2, nm=32, npr=256, params=(), ch=())
